@@ -3,6 +3,9 @@
 MatchDialog - a PyQt5 dialog to present fuzzy candidates and let the user pick one.
 Updated: Restored original design with enhanced IGDB and Steam search buttons.
 Fixed: Thread destruction error and IGDB search issues.
+Removed "Apply + Next" button.
+Apply button is now enabled only when a candidate has either an IGDB ID or a Steam ID.
+Open candidate button now respects the currently selected tab (IGDB or Steam).
 
 Usage:
   dlg = MatchDialog(original_item, candidates, parent=window)
@@ -13,10 +16,10 @@ Usage:
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
     QLabel, QPushButton, QTextEdit, QLineEdit, QCheckBox, QMessageBox, QWidget,
-    QApplication, QGroupBox, QFormLayout, QFrame, QTabWidget
+    QApplication, QGroupBox, QFormLayout, QSplitter, QFrame, QTabWidget
 )
 from PyQt5.QtGui import QPixmap
-from PyQt5.QtCore import Qt, QSize, QCoreApplication, QThread, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, QSize, QCoreApplication, QThread, pyqtSignal, QObject, QTimer
 import webbrowser
 import requests
 from urllib.parse import quote_plus
@@ -25,6 +28,7 @@ import argparse
 import time
 import json
 from typing import Dict, List, Optional, Any
+import config
 
 # Use scraping module for all candidate searches
 try:
@@ -61,7 +65,45 @@ class ImageLoader(QThread):
         self.quit()
         self.wait()
 
+class MetadataFetcher(QThread):
+    """Fetch full metadata for a candidate (IGDB or Steam) in background."""
+    metadata_ready = pyqtSignal(dict, str)
 
+    def __init__(self, candidate: dict, source: str):
+        super().__init__()
+        self.candidate = candidate
+        self.source = source
+
+    def run(self):
+        try:
+            source_str = self.candidate.get('source', '').lower()
+            # Skip fetching for test/dummy candidates
+            if source_str == 'test' or source_str.startswith('manual'):
+                self.metadata_ready.emit(self.candidate, self.source)
+                return
+
+            if self.source == 'igdb':
+                igdb_id = self.candidate.get('id') or self.candidate.get('igdb_id')
+                title = self.candidate.get('name') or self.candidate.get('title')
+                # Only fetch if ID is numeric and not obviously dummy (e.g., 12345)
+                if igdb_id and str(igdb_id).isdigit() and int(igdb_id) > 10000:
+                    result = scraping.igdb_scraper(title, igdb_id=igdb_id, auto_accept_score=0)
+                    if result and '__error__' not in result and '__candidates__' not in result:
+                        self.metadata_ready.emit(result, 'igdb')
+                        return
+            else:  # steam
+                steam_id = self.candidate.get('steam_id') or self.candidate.get('id') or self.candidate.get('steam_app_id')
+                if steam_id and str(steam_id).isdigit() and int(steam_id) > 10000:
+                    result = scraping.get_store_metadata(steam_id, self.candidate.get('name', ''))
+                    if result and result.get('title'):
+                        self.metadata_ready.emit(result, 'steam')
+                        return
+            # Fallback: emit original candidate
+            self.metadata_ready.emit(self.candidate, self.source)
+        except Exception as e:
+            print(f"[MetadataFetcher] Error: {e}")
+            self.metadata_ready.emit(self.candidate, self.source)
+            
 class MatchDialog(QDialog):
     """
     original_item: dict with keys 'title','original_title','description'
@@ -80,17 +122,29 @@ class MatchDialog(QDialog):
         # Image cache to avoid reloading
         self.image_cache = {}
         # Track active image loaders
+        self.current_igdb_desc = ""
+        self.current_steam_desc = ""
         self.active_image_loaders = []
-        
+        self.active_fetchers = []      # <-- add
+        self.fetcher_igdb = None       # <-- add
+        self.fetcher_steam = None      # <-- add
         # Initialize UI
         self.init_ui()
         
         # Select first candidate if present
         if self.igdb_list.count():
             self.igdb_list.setCurrentRow(0)
+        
+        # Auto-search missing sources if we have a title
+        title = self.manual_title.text().strip()
+        if title:
+            if self.igdb_list.count() == 0:
+                QTimer.singleShot(100, self.search_igdb_by_title)
+            if self.steam_list.count() == 0:
+                QTimer.singleShot(200, self.search_steam_by_title)
 
     def init_ui(self):
-        """Initialize the user interface."""
+        """Initialize the user interface with side-by-side previews."""
         main_layout = QHBoxLayout()
         
         # Left: candidate list and search controls
@@ -130,6 +184,7 @@ class MatchDialog(QDialog):
         # Manual search input
         search_layout.addWidget(QLabel("Manual Title:"))
         self.manual_title = QLineEdit(self.original.get('title', ''))
+        self.manual_title.setMinimumHeight(config.TEXT_BOX_HEIGHT)   # <-- added
         search_layout.addWidget(self.manual_title)
         
         # Manual IDs
@@ -137,11 +192,13 @@ class MatchDialog(QDialog):
         ids_layout.addWidget(QLabel("IGDB ID:"))
         self.manual_igdb_id = QLineEdit(self.original.get('igdb_id', ''))
         self.manual_igdb_id.setMaximumWidth(150)
+        self.manual_igdb_id.setMinimumHeight(config.TEXT_BOX_HEIGHT)  # <-- added
         ids_layout.addWidget(self.manual_igdb_id)
         
         ids_layout.addWidget(QLabel("Steam ID:"))
         self.manual_steam_id = QLineEdit(self.original.get('steam_id', '') or self.original.get('app_id', ''))
         self.manual_steam_id.setMaximumWidth(150)
+        self.manual_steam_id.setMinimumHeight(config.TEXT_BOX_HEIGHT) # <-- added
         ids_layout.addWidget(self.manual_steam_id)
         
         search_layout.addLayout(ids_layout)
@@ -150,7 +207,7 @@ class MatchDialog(QDialog):
         left_layout.addWidget(search_group)
         
         # Candidate lists with tabs
-        tabs_widget = QTabWidget()
+        self.tabs_widget = QTabWidget()
         
         # IGDB tab
         igdb_tab = QWidget()
@@ -159,7 +216,7 @@ class MatchDialog(QDialog):
         self.igdb_list.setAlternatingRowColors(True)
         igdb_layout.addWidget(self.igdb_list)
         igdb_tab.setLayout(igdb_layout)
-        tabs_widget.addTab(igdb_tab, "IGDB Results")
+        self.tabs_widget.addTab(igdb_tab, "IGDB Results")
         
         # Steam tab
         steam_tab = QWidget()
@@ -168,73 +225,110 @@ class MatchDialog(QDialog):
         self.steam_list.setAlternatingRowColors(True)
         steam_layout.addWidget(self.steam_list)
         steam_tab.setLayout(steam_layout)
-        tabs_widget.addTab(steam_tab, "Steam Results")
+        self.tabs_widget.addTab(steam_tab, "Steam Results")
         
-        left_layout.addWidget(tabs_widget, 1)  # Give it stretch
+        left_layout.addWidget(self.tabs_widget, 1)
+        
+        # Load more buttons
+        self.load_more_igdb_btn = QPushButton("Load More IGDB Candidates (+10)")
+        self.load_more_steam_btn = QPushButton("Load More Steam Candidates (+10)")
+        load_more_layout = QHBoxLayout()
+        load_more_layout.addWidget(self.load_more_igdb_btn)
+        load_more_layout.addWidget(self.load_more_steam_btn)
+        left_layout.addLayout(load_more_layout)
         
         left_widget.setLayout(left_layout)
         main_layout.addWidget(left_widget)
         
-        # Right: preview and manual fields
+        # Right: side-by-side previews
         right_widget = QWidget()
         right_layout = QVBoxLayout()
         
-        # Original item info (removed description as requested)
+        # Original item info
         self.title_label = QLabel(f"<b>Original:</b> {self.original.get('original_title') or self.original.get('title','')}")
         self.title_label.setWordWrap(True)
+        right_layout.addWidget(self.title_label)
         
-        # Preview area
-        preview_frame = QFrame()
-        preview_frame.setFrameStyle(QFrame.Box | QFrame.Raised)
-        preview_layout = QHBoxLayout()
+        # Splitter for IGDB and Steam previews
+        self.preview_splitter = QSplitter(Qt.Horizontal)
         
-        self.cover = QLabel()
-        self.cover.setFixedSize(QSize(220, 120))
-        self.cover.setAlignment(Qt.AlignCenter)
-        self.cover.setStyleSheet("border: 1px solid #ccc; background-color: #f0f0f0;")
-        self.cover.setText("No cover")
+        # ---- IGDB Preview ----
+        igdb_preview_widget = QWidget()
+        igdb_preview_layout = QVBoxLayout(igdb_preview_widget)
+        igdb_preview_layout.setAlignment(Qt.AlignTop)
         
-        self.meta = QLabel()
-        self.meta.setWordWrap(True)
-        self.meta.setTextInteractionFlags(Qt.TextBrowserInteraction)
-        self.meta.setOpenExternalLinks(True)
+        igdb_header = QLabel("<b>IGDB Candidate</b>")
+        igdb_header.setAlignment(Qt.AlignCenter)
+        igdb_preview_layout.addWidget(igdb_header)
         
-        preview_layout.addWidget(self.cover)
-        preview_layout.addWidget(self.meta)
-        preview_frame.setLayout(preview_layout)
+        self.cover_igdb = QLabel()
+        self.cover_igdb.setFixedSize(QSize(120, 160))
+        self.cover_igdb.setAlignment(Qt.AlignCenter)
+        self.cover_igdb.setStyleSheet("border: 1px solid #ccc; background-color: #f0f0f0;")
+        self.cover_igdb.setText("IGDB\nNo cover")
+        igdb_preview_layout.addWidget(self.cover_igdb, alignment=Qt.AlignCenter)
         
-        # Description preview
+        self.igdb_meta = QLabel()
+        self.igdb_meta.setWordWrap(True)
+        self.igdb_meta.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.igdb_meta.setOpenExternalLinks(True)
+        igdb_preview_layout.addWidget(self.igdb_meta)
+        
+        # ---- Steam Preview ----
+        steam_preview_widget = QWidget()
+        steam_preview_layout = QVBoxLayout(steam_preview_widget)
+        steam_preview_layout.setAlignment(Qt.AlignTop)
+        
+        steam_header = QLabel("<b>Steam Candidate</b>")
+        steam_header.setAlignment(Qt.AlignCenter)
+        steam_preview_layout.addWidget(steam_header)
+        
+        self.cover_steam = QLabel()
+        self.cover_steam.setFixedSize(QSize(240, 120))
+        self.cover_steam.setAlignment(Qt.AlignCenter)
+        self.cover_steam.setStyleSheet("border: 1px solid #ccc; background-color: #f0f0f0;")
+        self.cover_steam.setText("Steam\nNo cover")
+        
+        steam_preview_layout.addWidget(self.cover_steam, alignment=Qt.AlignCenter)
+        
+        self.steam_meta = QLabel()
+        self.steam_meta.setWordWrap(True)
+        self.steam_meta.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.steam_meta.setOpenExternalLinks(True)
+        steam_preview_layout.addWidget(self.steam_meta)
+        
+        self.preview_splitter.addWidget(igdb_preview_widget)
+        self.preview_splitter.addWidget(steam_preview_widget)
+        self.preview_splitter.setSizes([300, 300])
+        
+        right_layout.addWidget(self.preview_splitter, 1)
+        
+        # ---- Combined Description Area ----
+        desc_group = QGroupBox("Candidate Descriptions")
+        desc_layout = QVBoxLayout(desc_group)
         self.desc_preview = QTextEdit()
         self.desc_preview.setReadOnly(True)
-        self.desc_preview.setFixedHeight(150)
+        self.desc_preview.setMinimumHeight(150)
+        desc_layout.addWidget(self.desc_preview)
+        right_layout.addWidget(desc_group)
         
-        # Action buttons
+        # Action buttons (Apply + Next removed)
+        btn_row = QHBoxLayout()
         self.apply_btn = QPushButton("Apply Selected")
-        self.apply_next_btn = QPushButton("Apply + Next")
         self.skip_btn = QPushButton("Skip")
-        self.open_btn = QPushButton("Open Candidate")
+        self.open_btn = QPushButton("Open Candidate Page")
         self.overwrite_chk = QCheckBox("Overwrite existing fields")
         
-        # Status label
-        self.status_label = QLabel("")
-        self.status_label.setStyleSheet("color: #666; font-size: 10pt;")
-        
-        # Add widgets to right layout
-        right_layout.addWidget(self.title_label)
-        right_layout.addWidget(QLabel("<b>Candidate Preview:</b>"))
-        right_layout.addWidget(preview_frame)
-        right_layout.addWidget(QLabel("<b>Candidate Description:</b>"))
-        right_layout.addWidget(self.desc_preview)
-        right_layout.addWidget(self.status_label)
-        
-        # Buttons row
-        btn_row = QHBoxLayout()
         btn_row.addWidget(self.apply_btn)
-        btn_row.addWidget(self.apply_next_btn)
         btn_row.addWidget(self.open_btn)
         btn_row.addWidget(self.skip_btn)
         right_layout.addLayout(btn_row)
         right_layout.addWidget(self.overwrite_chk)
+        
+        # Status label
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #666; font-size: 10pt;")
+        right_layout.addWidget(self.status_label)
         
         right_widget.setLayout(right_layout)
         main_layout.addWidget(right_widget)
@@ -242,10 +336,11 @@ class MatchDialog(QDialog):
         self.setLayout(main_layout)
         
         # Connect signals
-        self.igdb_list.currentItemChanged.connect(lambda current, previous: self.on_candidate_selected(current, previous, 'igdb'))
-        self.steam_list.currentItemChanged.connect(lambda current, previous: self.on_candidate_selected(current, previous, 'steam'))
+        self.igdb_list.currentItemChanged.connect(lambda current, previous: self._update_igdb_preview(current))
+        self.igdb_list.itemClicked.connect(lambda item: self._update_igdb_preview(item))
+        self.steam_list.currentItemChanged.connect(lambda current, previous: self._update_steam_preview(current))
+        self.steam_list.itemClicked.connect(lambda item: self._update_steam_preview(item))
         self.apply_btn.clicked.connect(self.on_apply)
-        self.apply_next_btn.clicked.connect(self.on_apply_next)
         self.skip_btn.clicked.connect(self.reject)
         self.open_btn.clicked.connect(self.on_open_candidate)
         self.igdb_search_title_btn.clicked.connect(self.search_igdb_by_title)
@@ -253,24 +348,31 @@ class MatchDialog(QDialog):
         self.steam_search_title_btn.clicked.connect(self.search_steam_by_title)
         self.steam_search_id_btn.clicked.connect(self.lookup_steam_by_id)
         self.search_both_btn.clicked.connect(self.search_both_by_title)
+        self.load_more_igdb_btn.clicked.connect(lambda: self.load_more_candidates('igdb', 10))
+        self.load_more_steam_btn.clicked.connect(lambda: self.load_more_candidates('steam', 10))
         
         # Initialize button states
         self.apply_btn.setEnabled(False)
-        self.apply_next_btn.setEnabled(False)
         self.open_btn.setEnabled(False)
         
-        # Populate initial candidates into appropriate lists
+        # Populate initial candidates
         self._populate_initial_candidates()
-
+            
     def closeEvent(self, event):
-        """Clean up threads when dialog closes."""
+        # Stop all fetchers
+        for fetcher in self.active_fetchers:
+            if fetcher.isRunning():
+                fetcher.quit()
+                fetcher.wait()
+        self.active_fetchers.clear()
+        # Stop image loaders
         for loader in self.active_image_loaders:
             if loader.isRunning():
                 loader.quit()
                 loader.wait()
         self.active_image_loaders.clear()
         event.accept()
-
+        
     def _populate_initial_candidates(self):
         """Separate initial candidates into IGDB and Steam lists."""
         for cand in self.candidates:
@@ -280,9 +382,214 @@ class MatchDialog(QDialog):
             elif 'steam' in source:
                 self._add_candidate_to_list(cand, 'steam')
             else:
-                # Default to IGDB if source not specified
                 self._add_candidate_to_list(cand, 'igdb')
+        
+        # Manually trigger preview for first IGDB candidate
+        if self.igdb_list.count():
+            first_item = self.igdb_list.item(0)
+            if first_item:
+                self._update_igdb_preview(first_item)
+                
+    def _update_igdb_preview(self, item):
+        """Update the IGDB preview panel when a candidate is selected."""
+        if not item:
+            self.cover_igdb.setText("IGDB\nNo cover")
+            self.cover_igdb.setPixmap(QPixmap())
+            self.igdb_meta.setText("")
+            self.apply_btn.setEnabled(False)
+            self.current_igdb_desc = ""
+            self._update_combined_description()
+            return
 
+        c = item.data(Qt.UserRole)
+        # Enable Apply button only if candidate has an IGDB ID (or Steam ID from this tab, but this is IGDB tab)
+        has_igdb_id = bool(c.get('id') or c.get('igdb_id'))
+        has_steam_id = bool(c.get('steam_id') or c.get('steam_app_id') or c.get('app_id'))
+        self.apply_btn.setEnabled(has_igdb_id or has_steam_id)   # now allows Steam ID also
+        self.open_btn.setEnabled(True)
+
+        # Stop existing IGDB fetcher
+        if self.fetcher_igdb and self.fetcher_igdb.isRunning():
+            self.fetcher_igdb.quit()
+            self.fetcher_igdb.wait()
+            if self.fetcher_igdb in self.active_fetchers:
+                self.active_fetchers.remove(self.fetcher_igdb)
+
+        if '_full_metadata' in c:
+            self._display_igdb_candidate(c['_full_metadata'])
+        else:
+            self.igdb_meta.setText("<i>Loading full metadata...</i>")
+            self.current_igdb_desc = "Loading description..."
+            self._update_combined_description()
+            self.fetcher_igdb = MetadataFetcher(c, 'igdb')
+            self.active_fetchers.append(self.fetcher_igdb)
+            self.fetcher_igdb.metadata_ready.connect(lambda meta, src: self._on_igdb_metadata_fetched(meta, item))
+            self.fetcher_igdb.start()
+            
+    def _display_igdb_candidate(self, c: dict):
+        """Display IGDB candidate data."""
+        # Cover
+        cover_url = c.get('cover_url') or c.get('igdb_cover_url') or c.get('tiny_image')
+        if cover_url:
+            self.load_image_async(cover_url, 'igdb')
+        else:
+            self.cover_igdb.setText("IGDB\nNo cover")
+            self.cover_igdb.setPixmap(QPixmap())
+        
+        # Metadata
+        igdb_id = c.get('id') or c.get('igdb_id') or ""
+        meta_html = f"<b>{c.get('name','') or c.get('title','')}</b><br>"
+        if igdb_id:
+            meta_html += f"IGDB ID: {igdb_id}<br>"
+        if c.get('genres'):
+            meta_html += f"Genres: {c.get('genres')}<br>"
+        if c.get('developer'):
+            meta_html += f"Developer: {c.get('developer')}<br>"
+        if c.get('publisher'):
+            meta_html += f"Publisher: {c.get('publisher')}<br>"
+        if c.get('release_date'):
+            meta_html += f"Release: {c.get('release_date')}<br>"
+        meta_html += f"Score: {int(c.get('score',0))}%<br>Source: {c.get('source','')}"
+        if c.get('rating_display'):
+            meta_html += f"<br>Rating: {c.get('rating_display')}"
+        self.igdb_meta.setText(meta_html)
+        # Update manual fields
+        if c.get('name') or c.get('title'):
+            self.manual_title.setText(c.get('name') or c.get('title'))
+        igdb_id = c.get('id') or c.get('igdb_id') or ""
+        self.manual_igdb_id.setText(str(igdb_id) if igdb_id else "N/A")
+        # Do NOT clear Steam ID field (leave as is)
+        
+        # Description
+        desc = c.get('description') or c.get('summary') or ''
+        self.current_igdb_desc = desc
+        self._update_combined_description()
+
+    def _update_steam_preview(self, item):
+        """Update the Steam preview panel when a candidate is selected."""
+        if not item:
+            self.cover_steam.setText("Steam\nNo cover")
+            self.cover_steam.setPixmap(QPixmap())
+            self.steam_meta.setText("")
+            self.apply_btn.setEnabled(False)
+            self.current_steam_desc = ""
+            self._update_combined_description()
+            return
+
+        c = item.data(Qt.UserRole)
+        # Enable Apply button if candidate has either IGDB or Steam ID
+        has_igdb_id = bool(c.get('id') or c.get('igdb_id'))
+        has_steam_id = bool(c.get('steam_id') or c.get('steam_app_id') or c.get('app_id'))
+        self.apply_btn.setEnabled(has_igdb_id or has_steam_id)
+        self.open_btn.setEnabled(True)
+
+        # Stop existing Steam fetcher
+        if self.fetcher_steam and self.fetcher_steam.isRunning():
+            self.fetcher_steam.quit()
+            self.fetcher_steam.wait()
+            if self.fetcher_steam in self.active_fetchers:
+                self.active_fetchers.remove(self.fetcher_steam)
+
+        if '_full_metadata' in c:
+            self._display_steam_candidate(c['_full_metadata'])
+        else:
+            self.steam_meta.setText("<i>Loading full metadata...</i>")
+            self.current_steam_desc = "Loading description..."
+            self._update_combined_description()
+            self.fetcher_steam = MetadataFetcher(c, 'steam')
+            self.active_fetchers.append(self.fetcher_steam)
+            self.fetcher_steam.metadata_ready.connect(lambda meta, src: self._on_steam_metadata_fetched(meta, item))
+            self.fetcher_steam.start()
+        
+    def _display_steam_candidate(self, c: dict):
+        """Display Steam candidate data."""
+        # Cover
+        cover_url = c.get('cover_url') or c.get('tiny_image') or c.get('header_image')
+        steam_id = c.get('steam_id') or c.get('steam_app_id') or c.get('app_id')
+        if steam_id and not cover_url:
+            cover_url = f"https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{steam_id}/header.jpg"
+        if cover_url:
+            self.load_image_async(cover_url, 'steam')
+        else:
+            self.cover_steam.setText("Steam\nNo cover")
+            self.cover_steam.setPixmap(QPixmap())
+        
+        # Metadata
+        steam_id = c.get('steam_id') or c.get('steam_app_id') or c.get('app_id') or ""
+        meta_html = f"<b>{c.get('name','') or c.get('title','')}</b><br>"
+        if steam_id:
+            meta_html += f"Steam ID: {steam_id}<br>"
+        if c.get('genres'):
+            meta_html += f"Genres: {c.get('genres')}<br>"
+        if c.get('developer'):
+            meta_html += f"Developer: {c.get('developer')}<br>"
+        if c.get('publisher'):
+            meta_html += f"Publisher: {c.get('publisher')}<br>"
+        if c.get('release_date'):
+            meta_html += f"Release: {c.get('release_date')}<br>"
+        meta_html += f"Score: {int(c.get('score',0))}%<br>Source: {c.get('source','')}"
+        self.steam_meta.setText(meta_html)
+        # Update manual fields
+        if c.get('name') or c.get('title'):
+            self.manual_title.setText(c.get('name') or c.get('title'))
+        steam_id = c.get('steam_id') or c.get('steam_app_id') or c.get('app_id') or ""
+        self.manual_steam_id.setText(str(steam_id) if steam_id else "N/A")
+        # Do NOT clear IGDB ID field
+        # Description
+        desc = c.get('description') or c.get('summary') or ''
+        self.current_steam_desc = desc
+        self._update_combined_description()
+
+    def _on_igdb_metadata_fetched(self, metadata, list_item):
+        # Check if the list item still exists and belongs to the IGDB list
+        try:
+            # Verify the item is still in the list
+            row = self.igdb_list.row(list_item)
+            if row == -1:
+                return  # Item no longer in list
+            # Also verify the item hasn't been replaced
+            if self.igdb_list.item(row) is not list_item:
+                return
+            c = list_item.data(Qt.UserRole)
+            if c is None:
+                return
+            c['_full_metadata'] = metadata
+            list_item.setData(Qt.UserRole, c)
+            # Only update preview if this item is currently selected
+            if self.igdb_list.currentItem() == list_item:
+                self._display_igdb_candidate(metadata)
+        except RuntimeError:
+            # Item was deleted
+            pass
+
+    def _on_steam_metadata_fetched(self, metadata, list_item):
+        try:
+            row = self.steam_list.row(list_item)
+            if row == -1:
+                return
+            if self.steam_list.item(row) is not list_item:
+                return
+            c = list_item.data(Qt.UserRole)
+            if c is None:
+                return
+            c['_full_metadata'] = metadata
+            list_item.setData(Qt.UserRole, c)
+            if self.steam_list.currentItem() == list_item:
+                self._display_steam_candidate(metadata)
+        except RuntimeError:
+            pass
+            
+    def _update_combined_description(self):
+        """Combine IGDB and Steam descriptions into the single text area."""
+        html = ""
+        if self.current_igdb_desc:
+            html += f"<b>🎮 IGDB Description:</b><br>{self.current_igdb_desc}<br><br>"
+        if self.current_steam_desc:
+            html += f"<b>🖥️ Steam Description:</b><br>{self.current_steam_desc}"
+        if not html:
+            html = "<i>No descriptions available</i>"
+        self.desc_preview.setHtml(html)
+    
     # -------------------------
     # Candidate list helpers
     # -------------------------
@@ -502,9 +809,6 @@ class MatchDialog(QDialog):
         try:
             QCoreApplication.processEvents()
             
-            # Clear IGDB ID when searching Steam by title
-            # self.manual_igdb_id.clear()
-            
             # Use scraping module to find Steam candidates
             candidates = scraping.find_candidates_for_title(title, max_candidates=12)
             
@@ -517,16 +821,18 @@ class MatchDialog(QDialog):
             self.steam_list.clear()
             for candidate in candidates:
                 # Convert to our format
-                formatted_candidate = {
+                formatted = {
                     "id": candidate.get("id", ""),
                     "steam_id": candidate.get("id", ""),
                     "steam_app_id": candidate.get("id", ""),
                     "name": candidate.get("name", title),
                     "score": candidate.get("score", 0),
                     "source": candidate.get("source", "steam"),
-                    "tiny_image": candidate.get("tiny_image", "")
+                    "tiny_image": candidate.get("tiny_image", ""),
+                    "cover_url": candidate.get("cover_url", ""),
+                    "description": candidate.get("description", "")
                 }
-                self._add_candidate_to_list(formatted_candidate, 'steam')
+                self._add_candidate_to_list(formatted, 'steam')
             
             self.status_label.setText(f"Found {len(candidates)} Steam candidates.")
             
@@ -536,7 +842,7 @@ class MatchDialog(QDialog):
         finally:
             self.setCursor(old_cursor)
             QCoreApplication.processEvents()
-
+            
     def lookup_steam_by_id(self):
         """Lookup specific game by Steam AppID only."""
         if not HAVE_SCRAPING:
@@ -634,16 +940,18 @@ class MatchDialog(QDialog):
             try:
                 steam_raw = scraping.find_candidates_for_title(title, max_candidates=6)
                 for candidate in steam_raw:
-                    formatted_candidate = {
+                    formatted = {
                         "id": candidate.get("id", ""),
                         "steam_id": candidate.get("id", ""),
                         "steam_app_id": candidate.get("id", ""),
                         "name": candidate.get("name", title),
                         "score": candidate.get("score", 0),
                         "source": candidate.get("source", "steam"),
-                        "tiny_image": candidate.get("tiny_image", "")
+                        "tiny_image": candidate.get("tiny_image", ""),
+                        "cover_url": candidate.get("cover_url", ""),
+                        "description": candidate.get("description", "")
                     }
-                    steam_candidates.append(formatted_candidate)
+                    steam_candidates.append(formatted)
             except Exception as e:
                 print(f"Steam search error: {e}")
             
@@ -666,295 +974,298 @@ class MatchDialog(QDialog):
         finally:
             self.setCursor(old_cursor)
             QCoreApplication.processEvents()
-
+            
     # -------------------------
     # Candidate selection preview
     # -------------------------
-    def on_candidate_selected(self, current, previous, source: str):
-        if not current:
-            self.cover.clear()
-            self.cover.setText("No cover")
-            self.meta.setText("")
-            self.desc_preview.clear()
-            self.apply_btn.setEnabled(False)
-            self.apply_next_btn.setEnabled(False)
-            self.open_btn.setEnabled(False)
-            return
-        
-        c = current.data(Qt.UserRole)
-        
-        # Enable action buttons
-        self.apply_btn.setEnabled(True)
-        self.apply_next_btn.setEnabled(True)
-        self.open_btn.setEnabled(True)
-        
-        # Try to load image from candidate data
-        cover_url = c.get('cover_url') or c.get('tiny_image') or ""
-        if cover_url and cover_url.startswith(('http://', 'https://')):
-            # Check cache first
-            if cover_url in self.image_cache:
-                pixmap = self.image_cache[cover_url]
-                self.set_cover_image(pixmap)
-            else:
-                # Load asynchronously
-                self.cover.setText("Loading...")
-                self.load_image_async(cover_url)
-        else:
-            self.cover.setText("No cover")
-            self.cover.setPixmap(QPixmap())
+          
 
-        # Build metadata display with IGDB and Steam info
-        igdb_id = c.get('id') or c.get('igdb_id') or ""
-        steam_id = c.get('steam_id') or c.get('steam_app_id') or c.get('app_id') or ""
-        
-        meta_html = f"<b>{c.get('name','')}</b><br>"
-        if igdb_id:
-            meta_html += f"IGDB ID: {igdb_id}<br>"
-        if steam_id:
-            meta_html += f"Steam ID: {steam_id}<br>"
-        
-        # Add additional metadata if available
-        if c.get('genres'):
-            meta_html += f"Genres: {c.get('genres')}<br>"
-        if c.get('developer'):
-            meta_html += f"Developer: {c.get('developer')}<br>"
-        if c.get('publisher'):
-            meta_html += f"Publisher: {c.get('publisher')}<br>"
-        if c.get('release_date'):
-            meta_html += f"Release: {c.get('release_date')}<br>"
-        
-        meta_html += f"Score: {int(c.get('score',0))}%<br>Source: {c.get('source','')}"
-        
-        # Add rating if available
-        if c.get('rating_display'):
-            meta_html += f"<br>Rating: {c.get('rating_display')}"
-        
-        # Add links (removed SteamDB and PCGamingWiki as requested)
-        links_added = False
-        links_html = "<br>Links: "
-        
-        if igdb_id:
-            igdb_link = f"https://www.igdb.com/games/{igdb_id}"
-            links_html += f"<a href='{igdb_link}'>IGDB</a>"
-            links_added = True
-        elif c.get('name'):
-            igdb_link = f"https://www.igdb.com/search?query={quote_plus(c.get('name'))}"
-            links_html += f"<a href='{igdb_link}'>IGDB Search</a>"
-            links_added = True
-            
-        if steam_id:
-            steam_link = f"https://store.steampowered.com/app/{steam_id}"
-            if links_added:
-                links_html += " | "
-            links_html += f"<a href='{steam_link}'>Steam</a>"
-            links_added = True
-        
-        if links_added:
-            meta_html += links_html
-
-        self.meta.setText(meta_html)
-        
-        # Update description preview
-        description = c.get('description', '') or c.get('summary', '')
-        self.desc_preview.setPlainText(description)
-        
-        # Update manual fields - IMPORTANT: Don't overwrite IDs from opposite source
-        # Update manual fields - IMPORTANT: Don't overwrite IDs from opposite source
-        if c.get('name'):
-            self.manual_title.setText(c.get('name'))
-        
-        # Only update IGDB ID field if we're selecting from IGDB list
-        if source == 'igdb':
-            igdb_id = c.get('id') or c.get('igdb_id') or ""
-            self.manual_igdb_id.setText(str(igdb_id) if igdb_id else "N/A")
-        
-        # Only update Steam ID field if we're selecting from Steam list
-        if source == 'steam':
-            steam_id = c.get('steam_id') or c.get('steam_app_id') or c.get('app_id') or ""
-            self.manual_steam_id.setText(str(steam_id) if steam_id else "N/A")
-
-    def load_image_async(self, url: str):
-        """Load image asynchronously in background thread."""
+    def load_image_async(self, url: str, target: str):
+        """Load image asynchronously for a specific cover (igdb or steam)."""
         if not url or url in self.image_cache:
+            # If already cached, apply directly
+            if url in self.image_cache:
+                self._apply_cached_image(url, target)
             return
         
-        # Clean up any finished loaders
+        # Clean up finished loaders
         self.active_image_loaders = [loader for loader in self.active_image_loaders if loader.isRunning()]
         
-        # Create and start loader thread
+        # Create loader with target info
         loader = ImageLoader(url)
-        loader.image_loaded.connect(self.on_image_loaded)
+        # Use a lambda to capture target
+        loader.image_loaded.connect(lambda u, p: self.on_image_loaded(u, p, target))
         loader.finished.connect(lambda: self.active_image_loaders.remove(loader) if loader in self.active_image_loaders else None)
         self.active_image_loaders.append(loader)
         loader.start()
-
-    def on_image_loaded(self, url: str, pixmap: QPixmap):
-        """Handle image loaded signal."""
-        # Cache the image
-        self.image_cache[url] = pixmap
+        print(f"[Match_dialog] Loading image for {target}: {url}")
         
-        # Update cover if this is the current candidate's image
-        # Check both lists
+    def _apply_cached_image(self, url: str, target: str):
+        """Apply a cached pixmap to the correct cover label, scaled to fit 3:4 box."""
+        pixmap = self.image_cache.get(url)
+        target_label = self.cover_igdb if target == 'igdb' else self.cover_steam
+        if pixmap and not pixmap.isNull():
+            # Scale to fit inside label while preserving aspect ratio
+            scaled = pixmap.scaled(target_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            target_label.setPixmap(scaled)
+            target_label.setText("")
+        else:
+            target_label.setText(f"{target.upper()}\nNo cover")
+            target_label.setPixmap(QPixmap())
+            
+    def on_image_loaded(self, url: str, pixmap: QPixmap, target: str):
+        """Handle image loaded signal and update the correct cover."""
+        self.image_cache[url] = pixmap
+        # Determine which cover should receive this image based on current selection
         current_igdb = self.igdb_list.currentItem()
         current_steam = self.steam_list.currentItem()
         
-        current_item = current_igdb or current_steam
-        if current_item:
-            c = current_item.data(Qt.UserRole)
-            current_url = c.get('cover_url') or c.get('tiny_image') or ""
-            if current_url == url:
-                self.set_cover_image(pixmap)
-
-    def set_cover_image(self, pixmap: QPixmap):
-        """Set cover image with proper scaling."""
-        if pixmap and not pixmap.isNull():
-            scaled_pixmap = pixmap.scaled(
-                self.cover.size(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-            self.cover.setPixmap(scaled_pixmap)
-            self.cover.setText("")
-        else:
-            self.cover.setText("No cover")
-            self.cover.setPixmap(QPixmap())
-
+        # If the image belongs to the currently selected candidate of the matching source
+        if target == 'igdb' and current_igdb:
+            c = current_igdb.data(Qt.UserRole)
+            cand_url = c.get('cover_url') or c.get('igdb_cover_url') or c.get('tiny_image')
+            if cand_url == url:
+                self._apply_cached_image(url, 'igdb')
+        elif target == 'steam' and current_steam:
+            c = current_steam.data(Qt.UserRole)
+            cand_url = c.get('tiny_image') or c.get('cover_url')
+            if cand_url == url:
+                self._apply_cached_image(url, 'steam')
+        print(f"[Match_dialog] Image loaded for {target}: {url} (pixmap size: {pixmap.width()}x{pixmap.height()})")
+        
     # -------------------------
-    # Open candidate in browser
+    # Open candidate in browser (respects active tab)
     # -------------------------
     def on_open_candidate(self):
-        """Open selected candidate in browser."""
-        current_igdb = self.igdb_list.currentItem()
-        current_steam = self.steam_list.currentItem()
-        
-        current_item = current_igdb or current_steam
-        if not current_item:
+        """Open the currently selected candidate's page in a web browser.
+           If the active tab is IGDB, open IGDB page (using slug).
+           If the active tab is Steam, open Steam store page.
+        """
+        # Determine which list is active based on the visible tab
+        if not hasattr(self, 'tabs_widget'):
+            # Fallback: check selection directly
+            current_item = self.igdb_list.currentItem() or self.steam_list.currentItem()
+            if not current_item:
+                self.status_label.setText("No candidate selected.")
+                return
+            # Default to IGDB for old behavior
+            c = current_item.data(Qt.UserRole)
+            slug = c.get('slug')
+            if slug:
+                webbrowser.open(f"https://www.igdb.com/games/{slug}")
+            else:
+                steam_id = c.get('steam_id') or c.get('steam_app_id') or c.get('app_id')
+                if steam_id:
+                    webbrowser.open(f"https://store.steampowered.com/app/{steam_id}")
+            return
+
+        current_tab = self.tabs_widget.currentIndex()
+        if current_tab == 0:  # IGDB tab
+            current_item = self.igdb_list.currentItem()
+            if not current_item:
+                self.status_label.setText("No IGDB candidate selected.")
+                return
+            c = current_item.data(Qt.UserRole)
+            # Use slug if available, otherwise create one from the game name
+            slug = c.get('slug')
+            if not slug:
+                name = c.get('name') or c.get('title')
+                if name:
+                    import re
+                    slug = name.lower()
+                    slug = re.sub(r'[^\w\s-]', '', slug)  # Remove punctuation
+                    slug = re.sub(r'[-\s]+', '-', slug)   # Replace spaces/hyphens with a single hyphen
+                    slug = slug.strip('-')
+                else:
+                    # Fallback: search by name
+                    if name:
+                        webbrowser.open(f"https://www.igdb.com/search?query={quote_plus(name)}")
+                        return
+                    else:
+                        self.status_label.setText("No game name available to search.")
+                        return
+
+            webbrowser.open(f"https://www.igdb.com/games/{slug}")
+
+        else:  # Steam tab
+            current_item = self.steam_list.currentItem()
+            if not current_item:
+                self.status_label.setText("No Steam candidate selected.")
+                return
+            c = current_item.data(Qt.UserRole)
+            steam_id = c.get('steam_id') or c.get('steam_app_id') or c.get('app_id') or c.get('id')
+            if steam_id:
+                webbrowser.open(f"https://store.steampowered.com/app/{steam_id}")
+            else:
+                self.status_label.setText("No Steam AppID to open.")
+                
+                
+    # -------------------------
+    # Load more candidates
+    # -------------------------
+    def load_more_candidates(self, source: str, increment: int = 10):
+        """Load additional candidates for IGDB or Steam by increasing the limit."""
+        title = self.manual_title.text().strip()
+        if not title:
+            QMessageBox.information(self, "Load More", "Please enter a title first.")
             return
         
-        c = current_item.data(Qt.UserRole)
-        igdb_id = c.get('id') or c.get('igdb_id') or ""
-        steam_id = c.get('steam_id') or c.get('steam_app_id') or c.get('app_id') or ""
+        # Determine current limit: we don't store it, so we'll just re‑search with a higher limit.
+        # Simple approach: ask user for a new limit or just add increment to a guessed limit.
+        # Better: keep a counter. For simplicity, we'll re‑run the search with a higher limit.
+        # We'll use a hidden attribute to remember the last limit used.
+        if not hasattr(self, '_last_igdb_limit'):
+            self._last_igdb_limit = 12
+        if not hasattr(self, '_last_steam_limit'):
+            self._last_steam_limit = 12
         
-        # Prioritize IGDB link
-        if igdb_id:
-            webbrowser.open(f"https://www.igdb.com/games/{igdb_id}")
-        elif steam_id:
-            webbrowser.open(f"https://store.steampowered.com/app/{steam_id}")
-        elif c.get('name'):
-            webbrowser.open(f"https://www.igdb.com/search?query={quote_plus(c.get('name'))}")
+        if source == 'igdb':
+            new_limit = self._last_igdb_limit + increment
+            self._last_igdb_limit = new_limit
+            self.status_label.setText(f"Searching IGDB with limit {new_limit}...")
+            old_cursor = self.cursor()
+            self.setCursor(Qt.WaitCursor)
+            try:
+                QCoreApplication.processEvents()
+                candidates = scraping.find_candidates_for_title_igdb(title, max_candidates=new_limit)
+                # Clear and repopulate IGDB list
+                self.igdb_list.clear()
+                for cand in candidates:
+                    self._add_candidate_to_list(cand, 'igdb')
+                self.status_label.setText(f"Loaded {len(candidates)} IGDB candidates (limit {new_limit}).")
+            except Exception as e:
+                self.status_label.setText(f"IGDB load more failed: {str(e)[:50]}")
+            finally:
+                self.setCursor(old_cursor)
+        elif source == 'steam':
+            new_limit = self._last_steam_limit + increment
+            self._last_steam_limit = new_limit
+            self.status_label.setText(f"Searching Steam with limit {new_limit}...")
+            old_cursor = self.cursor()
+            self.setCursor(Qt.WaitCursor)
+            try:
+                QCoreApplication.processEvents()
+                raw_candidates = scraping.find_candidates_for_title(title, max_candidates=new_limit)
+                candidates = []
+                for cand in raw_candidates:
+                    
+                    formatted = {
+                        "id": cand.get("id", ""),
+                        "steam_id": cand.get("id", ""),
+                        "steam_app_id": cand.get("id", ""),
+                        "name": cand.get("name", title),
+                        "score": cand.get("score", 0),
+                        "source": cand.get("source", "steam"),
+                        "tiny_image": cand.get("tiny_image", ""),
+                        "cover_url": cand.get("cover_url", ""),
+                        "description": cand.get("description", "")
+                    }
+                    candidates.append(formatted)
+                self.steam_list.clear()
+                for cand in candidates:
+                    self._add_candidate_to_list(cand, 'steam')
+                self.status_label.setText(f"Loaded {len(candidates)} Steam candidates (limit {new_limit}).")
+            except Exception as e:
+                self.status_label.setText(f"Steam load more failed: {str(e)[:50]}")
+            finally:
+                self.setCursor(old_cursor)
 
     # -------------------------
-    # Collect result and finish
+    # Collect result
     # -------------------------
-    # In the _collect_result method (around line 843), modify it as follows:
-    def _collect_result(self):
-        """Get current candidate from either list."""
-        current_igdb = self.igdb_list.currentItem()
-        current_steam = self.steam_list.currentItem()
-        
-        current_item = current_igdb or current_steam
-        candidate = current_item.data(Qt.UserRole) if current_item else None
-        
-        overwrite = self.overwrite_chk.isChecked()
-        res = {"chosen_candidate": candidate, "applied_by": "user"}
-        
-        # Determine selected_title: Use IGDB title if available, otherwise original title
-        if candidate and candidate.get('name'):
-            res['selected_title'] = candidate.get('name')
-        else:
-            # Fall back to original title from original_item
-            original_title = self.original.get('original_title') or self.original.get('title', '')
-            res['selected_title'] = original_title if original_title else self.manual_title.text().strip()
-        
-        # Print selected game output to console
-        print("\n=== SELECTED GAME OUTPUT ===")
-        print(f"Original title: {self.original.get('title', '')}")
-        print(f"Selected candidate: {candidate.get('name', 'Unknown') if candidate else 'None'}")
-        print(f"Selected title (for output): {res['selected_title']}")
-        
-        # Title from manual field or candidate - keep existing logic for the 'title' field
+    def _collect_result(self, current_item, active_tab):
+        # Manual title is the final title (user can edit it freely)
         manual_title = self.manual_title.text().strip()
-        if manual_title:
-            res['title'] = manual_title
-            print(f"Manual title: {manual_title}")
-        elif candidate and candidate.get('name'):
-            res['title'] = candidate.get('name')
-            print(f"Title: {candidate.get('name')}")
-        else:
-            # Fallback to original if nothing else
-            original_title = self.original.get('original_title') or self.original.get('title', '')
-            res['title'] = original_title if original_title else "N/A"
-            print(f"Title (fallback): {res['title']}")
+        if not manual_title:
+            manual_title = self.original.get('title', 'Untitled')
         
-        # IGDB ID - Use "N/A" if not available
         manual_igdb_id = self.manual_igdb_id.text().strip()
-        if manual_igdb_id:
+        manual_steam_id = self.manual_steam_id.text().strip()
+        
+        candidate = current_item.data(Qt.UserRole) if current_item else None
+        overwrite = self.overwrite_chk.isChecked()
+        
+        res = {
+            "chosen_candidate": candidate,
+            "applied_by": "user",
+            "overwrite": overwrite,
+            # Final title is always the manual title
+            "title": manual_title,
+        }
+        
+        # Store the candidate's original name under the correct source
+        if candidate and candidate.get('name'):
+            if active_tab == 0:   # IGDB tab active
+                res['igdb_title'] = candidate.get('name')
+            else:                 # Steam tab active
+                res['steam_title'] = candidate.get('name')
+        
+        # IDs: manual input takes precedence over candidate
+        if manual_igdb_id and manual_igdb_id != "N/A":
             res['igdb_id'] = manual_igdb_id
-            print(f"IGDB ID: {manual_igdb_id}")
         elif candidate and candidate.get('id'):
             res['igdb_id'] = candidate.get('id')
-            print(f"IGDB ID: {candidate.get('id')}")
         elif candidate and candidate.get('igdb_id'):
             res['igdb_id'] = candidate.get('igdb_id')
-            print(f"IGDB ID: {candidate.get('igdb_id')}")
         else:
             res['igdb_id'] = "N/A"
-            print(f"IGDB ID: N/A (not available)")
         
-        # Steam ID - Use "N/A" if not available
-        manual_steam_id = self.manual_steam_id.text().strip()
-        if manual_steam_id:
+        if manual_steam_id and manual_steam_id != "N/A":
             res['steam_id'] = manual_steam_id
-            res['app_id'] = manual_steam_id  # Keep backward compatibility
-            print(f"Steam ID: {manual_steam_id}")
+            res['app_id'] = manual_steam_id
         elif candidate and candidate.get('steam_id'):
             res['steam_id'] = candidate.get('steam_id')
-            res['app_id'] = candidate.get('steam_id')  # Keep backward compatibility
-            print(f"Steam ID: {candidate.get('steam_id')}")
+            res['app_id'] = candidate.get('steam_id')
         elif candidate and candidate.get('steam_app_id'):
             res['steam_id'] = candidate.get('steam_app_id')
-            res['app_id'] = candidate.get('steam_app_id')  # Keep backward compatibility
-            print(f"Steam ID: {candidate.get('steam_app_id')}")
+            res['app_id'] = candidate.get('steam_app_id')
         elif candidate and candidate.get('app_id'):
             res['steam_id'] = candidate.get('app_id')
-            res['app_id'] = candidate.get('app_id')  # Keep backward compatibility
-            print(f"Steam ID: {candidate.get('app_id')}")
+            res['app_id'] = candidate.get('app_id')
         else:
             res['steam_id'] = "N/A"
-            res['app_id'] = "N/A"  # Keep backward compatibility
-            print(f"Steam ID: N/A (not available)")
+            res['app_id'] = "N/A"
         
-        # Additional metadata if available
+        # Additional metadata from candidate (genres, developer, etc.)
         if candidate:
-            for key in ['genres', 'developer', 'publisher', 'description', 'cover_url', 
-                       'release_date', 'rating_display', 'score', 'source']:
+            for key in ['genres', 'developer', 'publisher', 'description', 'cover_url',
+                        'release_date', 'rating_display', 'score', 'source']:
                 if key in candidate and candidate[key]:
                     res[key] = candidate[key]
-                    print(f"{key}: {candidate[key]}")
         
-        # Ensure 'genres' has a value (can be empty string from API)
         if 'genres' not in res or not res['genres']:
             res['genres'] = "N/A"
-            print("genres: N/A (not available)")
         
-        res['overwrite'] = overwrite
+        # Debug output
+        print("\n=== SELECTED GAME OUTPUT ===")
+        print(f"Manual Title (final): {res['title']}")
+        print(f"IGDB ID: {res['igdb_id']}")
+        print(f"Steam ID: {res['steam_id']}")
+        if 'igdb_title' in res:
+            print(f"IGDB Candidate Title: {res['igdb_title']}")
+        if 'steam_title' in res:
+            print(f"Steam Candidate Title: {res['steam_title']}")
         print(f"Overwrite: {overwrite}")
         print("=== END SELECTION ===\n")
         
         return res
-
+ 
     def on_apply(self):
-        self.result_dict = self._collect_result()
+        # Determine which tab is active (0 = IGDB, 1 = Steam)
+        active_tab = self.tabs_widget.currentIndex()
+        if active_tab == 0:
+            current = self.igdb_list.currentItem()
+        else:
+            current = self.steam_list.currentItem()
+        
+        if not current:
+            QMessageBox.warning(self, "No Selection", "Please select a candidate from the active tab.")
+            return
+        self.result_dict = self._collect_result(current, active_tab)
         self.accept()
 
-    def on_apply_next(self):
-        self.result_dict = self._collect_result()
-        # return custom code 2 to indicate apply+next
-        self.done(2)
-
-
 # ============================================================================
-# CLI Testing Functionality
+# CLI Testing Functionality (unchanged)
 # ============================================================================
 
 def test_dialog_cli():
@@ -1108,16 +1419,6 @@ def test_dialog_cli():
                     print(f"        {subkey}: {subvalue}")
             else:
                 print(f"      {key}: {value}")
-    elif result == 2:  # Apply + Next
-        print("\n[+] Dialog accepted with 'Apply + Next'!")
-        print("    Result dictionary:")
-        for key, value in dialog.result_dict.items():
-            if key == 'chosen_candidate' and value:
-                print(f"      {key}:")
-                for subkey, subvalue in value.items():
-                    print(f"        {subkey}: {subvalue}")
-            else:
-                print(f"      {key}: {value}")
     else:
         print("\n[+] Dialog rejected or skipped")
     
@@ -1154,7 +1455,7 @@ if __name__ == "__main__":
         print("  • Console output for selected games")
         print("  • Console output for scraped metadata")
         print("  • Mutual exclusive ID fields when searching by ID")
-        print("  • No SteamDB/PCGW links in preview")
+        print("  • Open candidate page respects the selected tab (IGDB or Steam)")
         print("\nExamples:")
         print("  python match_dialog.py \"Cyberpunk 2077\" --generate-candidates")
         print("  python match_dialog.py \"The Witcher 3\" --steam-id 292030 --igdb-id 1942")

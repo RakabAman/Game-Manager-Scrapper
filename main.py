@@ -2,7 +2,12 @@ import os
 import sys
 import ctypes
 from PyQt5.QtWidgets import QApplication
-from gui import GameManager  # import your real GUI class
+
+# Import the new GUI module
+from gui_main import GameManager
+
+# Import config to read console visibility setting
+from config import CONFIG_FILE, _load_config
 
 def get_base_dir():
     """Return the base directory for cache depending on run mode."""
@@ -18,43 +23,21 @@ def setup_cache():
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir
 
-# In main.py, update hide_console_and_redirect function:
-def hide_console_and_redirect():
-    """Hide console window and setup logging to file."""
-    import logging
-    
-    # Hide console
-    ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
-    
-    # Setup logging to file
+def setup_logging_and_console():
+    """
+    Set up logging to file. If config allows, also show console and tee output.
+    Returns the log file path.
+    """
     base_dir = get_base_dir()
     log_dir = os.path.join(base_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, "game_manager.log")
-    
-    # Configure logging
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
-        handlers=[
-            logging.FileHandler(log_path, encoding='utf-8'),
-            logging.StreamHandler(sys.stdout)  # Keep console output if console is shown
-        ]
-    )
-    
-    print(f"Logging to: {log_path}")
 
+    # Read config to decide whether to show console
+    config = _load_config()
+    show_console = config.getboolean("General", "show_console", fallback=False)
 
-def main():
-    # Setup logging first
-    base_dir = get_base_dir()
-    log_dir = os.path.join(base_dir, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    
-    log_path = os.path.join(log_dir, "game_manager.log")
-    
-    # Tee output to both console and file
+    # Tee class to write to multiple outputs
     class Tee:
         def __init__(self, *files):
             self.files = files
@@ -65,29 +48,41 @@ def main():
         def flush(self):
             for f in self.files:
                 f.flush()
-    
+
+    # Open log file for writing
     log_file = open(log_path, "w", encoding="utf-8")
-    
-    if "--show-console" not in sys.argv:
-        ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
-        sys.stdout = Tee(log_file)
-        sys.stderr = Tee(log_file)
-    else:
+
+    if show_console:
+        # Show console window (if it was hidden by default)
+        try:
+            ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 1)
+        except:
+            pass
+        # Tee to both original stdout/stderr and log file
         sys.stdout = Tee(sys.__stdout__, log_file)
         sys.stderr = Tee(sys.__stderr__, log_file)
-    
-    print(f"Application started. Log file: {log_path}")
-    
-    # Rest of your code...
-    # Hide console unless explicitly requested
-    if "--show-console" not in sys.argv:
-        hide_console_and_redirect()
+    else:
+        # Hide console window
+        try:
+            ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
+        except:
+            pass
+        # Tee only to log file
+        sys.stdout = Tee(log_file)
+        sys.stderr = Tee(log_file)
+
+    print(f"Log file: {log_path}")
+    return log_path
+
+def main():
+    # Setup logging and console first
+    log_path = setup_logging_and_console()
 
     # Prepare cache folder
     cache_dir = setup_cache()
     print(f"Cache folder ready at: {cache_dir}")
 
-    # Launch your PyQt5 GUI
+    # Launch PyQt5 GUI
     app = QApplication(sys.argv)
     window = GameManager()
     window.show()
