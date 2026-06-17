@@ -1,6 +1,6 @@
 # Game Manager
 
-**Version 2.24** – A comprehensive, open‑source game library manager with metadata scraping, media caching, and advanced export capabilities.
+A comprehensive, open‑source game library manager with metadata scraping, media caching, and advanced export capabilities.
 
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python)
 ![PyQt5](https://img.shields.io/badge/PyQt5-5.15+-green?logo=qt)
