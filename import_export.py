@@ -19,12 +19,32 @@ from typing import Tuple, List, Dict, Optional, Any
 import tempfile
 import warnings
 import re
+import sys
+import subprocess
+import requests
 import config
 import base64
-from cache_utils import _game_cache_dir_for_game
+from cache_utils import _game_cache_dir_for_game, resolve_cover_art_cache_path as _cache_resolve_cover_art_cache_path
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
+
+
+def _open_file_with_default_app(path: str) -> None:
+    """Open a file with the OS's default handler for its type (e.g. the
+    user's actual PDF reader), as opposed to webbrowser.open() which always
+    targets a web browser. Mirrors what double-clicking the file would do."""
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.run(["open", path], check=False)
+        else:
+            subprocess.run(["xdg-open", path], check=False)
+    except Exception:
+        # Fall back to the browser opener rather than silently failing.
+        webbrowser.open(Path(path).as_uri())
+
 
 # Optional libraries - import if available
 pd = None
@@ -186,26 +206,50 @@ def _enhance_igdb_images(game: Dict) -> Dict:
         game["screenshots"] = fixed
     return game
 
+def _resolve_cover_art_cache_path(game: Dict) -> Optional[str]:
+    """Thin wrapper around cache_utils.resolve_cover_art_cache_path (the
+    single shared implementation also used by image_display.py), kept here
+    so existing callers in this file don't need to change. Never creates a
+    directory, never touches the network."""
+    try:
+        p = _cache_resolve_cover_art_cache_path(game)
+        return str(p) if p else None
+    except Exception as e:
+        print(f"Thumbnail: could not resolve cover art for '{game.get('title','?')}': {e}")
+        return None
+
 def _get_thumbnail_data_uri(game: Dict) -> str:
     """Return a data URI for the cover thumbnail, or empty string if not available."""
-    # 1. Check cached coverart.jpg using application's cache directory
-    cache_dir = _game_cache_dir_for_game(game)
-    cover_path = cache_dir / "coverart.jpg"
-    if cover_path.exists():
+    # 1. Check the actual local cache (handles coverart.<ext> AND the
+    #    hash-named case, unlike the old hardcoded "coverart.jpg" check).
+    cover_path = _resolve_cover_art_cache_path(game)
+    if cover_path:
         try:
+            suffix = Path(cover_path).suffix.lower().lstrip(".")
+            mime = "jpeg" if suffix in ("jpg", "jpeg") else suffix
             with open(cover_path, "rb") as f:
                 img_data = base64.b64encode(f.read()).decode('utf-8')
-            return f"data:image/jpeg;base64,{img_data}"
-        except:
+            return f"data:image/{mime};base64,{img_data}"
+        except Exception:
             pass
-    
-    # 2. Try remote cover_url
+
+    # 2. Try remote cover_url (only reached if truly not cached locally)
     cover_url = game.get("cover_url", "")
     if cover_url:
         return cover_url  # external URL – will need internet
-    
+
     # 3. Placeholder (empty grey square)
     return "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23cccccc'/%3E%3C/svg%3E"
+
+def _pdf_thumbnail_path(game: Dict) -> Optional[str]:
+    """Return a local image file path usable by reportlab's Image flowable,
+    or None if no cached cover art exists. Deliberately does not fetch
+    remote cover_url (downloading synchronously during PDF export blocks
+    the app) — this only ever reads what's already on disk, but now checks
+    every way that file might actually have been named/saved (see
+    _resolve_cover_art_cache_path)."""
+    return _resolve_cover_art_cache_path(game)
+
 
 # ----------------------------------------------------------------------
 # Import functions (unchanged except for IGDB ID handling)
@@ -605,21 +649,23 @@ def _get_pdf_page_size():
     else:
         return landscape(letter)
 
-
 def export_games_to_pdf(path: str, games: List[Dict], title: Optional[str] = None,
                         description_lines: int = 4,
-                        columns: Optional[List[Dict]] = None) -> Optional[str]:
+                        columns: Optional[List[Dict]] = None,
+                        open_after: bool = False) -> Optional[str]:
     if not REPORTLAB_AVAILABLE:
         return "ReportLab is not installed. Install with: pip install reportlab"
-    return _export_games_to_pdf_reportlab(path, games, title, description_lines, columns)
+    return _export_games_to_pdf_reportlab(path, games, title, description_lines, columns, open_after)
+
+
 
 def _export_games_to_pdf_reportlab(path: str, games: List[Dict], title: Optional[str],
-                                   description_lines: int, columns: Optional[List[Dict]]) -> Optional[str]:
+                                   description_lines: int, columns: Optional[List[Dict]],
+                                   open_after: bool = False) -> Optional[str]:
     try:
         from reportlab.lib import colors
-        
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepInFrame, Image as RLImage
         from reportlab.lib.units import mm
         import time
         import html
@@ -632,7 +678,7 @@ def _export_games_to_pdf_reportlab(path: str, games: List[Dict], title: Optional
             ]
 
         total_pct = sum(col["width"] for col in columns)
-        page_size = _get_pdf_page_size()  # A3 landscape
+        page_size = _get_pdf_page_size()
         doc = SimpleDocTemplate(path, pagesize=page_size, leftMargin=8*mm, rightMargin=8*mm,
                                 topMargin=12*mm, bottomMargin=12*mm, title=title or "Game Collection Report")
         usable_width = page_size[0] - 16*mm
@@ -673,15 +719,12 @@ def _export_games_to_pdf_reportlab(path: str, games: List[Dict], title: Optional
         story.append(stats_table)
         story.append(Spacer(1, 8))
 
-        # Build headers, inserting SN column at front
         headers = [Paragraph(col["header"], header_style) for col in columns]
         headers.insert(0, Paragraph("SN", header_style))
         table_data = [headers]
 
-        desc_idx = next((i for i, col in enumerate(columns) if col["key"] == "description"), None)
         link_opts = _get_link_options()
 
-        # --- duplicate detection for exported games ---
         title_counts = {}
         for g in games:
             t = (g.get("title") or "").strip().lower()
@@ -691,7 +734,6 @@ def _export_games_to_pdf_reportlab(path: str, games: List[Dict], title: Optional
 
         row_colors = []
         for game in games:
-            # priority: fav > duplicate > played > unplayed
             if game.get("fav", False):
                 raw_color = config.FAVORITE_COLOR
             elif (game.get("title") or "").strip().lower() in dup_titles:
@@ -702,27 +744,66 @@ def _export_games_to_pdf_reportlab(path: str, games: List[Dict], title: Optional
                 raw_color = config.UNPLAYED_COLOR
             desat = config.desaturate_color(raw_color, config.HIGHLIGHT_DESATURATE_PERCENT)
             row_colors.append(colors.HexColor(desat))
-                
+
+        # Accurate line height: 7pt = 2.47 mm
+        line_height_mm = 7.0 / 72.0 * 25.4   # ~2.47 mm
+        row_height_pts = (line_height_mm * description_lines) * mm
+
+        sn_width = usable_width * 0.03
+
+        def _clipped(flowable_or_list, max_width_pt):
+            """Hard-clip a flowable (or list of stacked flowables, e.g. a
+            thumbnail Image above a title Paragraph) to the row height, same
+            role as CSS overflow:hidden in the HTML export. Even if the
+            character-count truncation above slightly misjudges and the
+            content would still need more vertical space than
+            row_height_pts allows, KeepInFrame cuts it off cleanly instead
+            of overlapping the next row or raising a LayoutError.
+            mode='truncate' clips; it does not shrink or error."""
+            content = flowable_or_list if isinstance(flowable_or_list, list) else [flowable_or_list]
+            return KeepInFrame(
+                maxWidth=max_width_pt,
+                maxHeight=row_height_pts,
+                content=content,
+                mode='truncate',
+                hAlign='LEFT',
+                vAlign='TOP',
+            )
+
         for idx, game in enumerate(games, 1):
             row = []
             for col_idx, col in enumerate(columns):
                 key = col["key"]
+
+                # --- RESOURCES ---
                 if key == "resources":
                     screenshots = list(game.get("screenshots", []) or []) + list(game.get("image_cache_paths", []) or [])
-                    trailers = [game.get("trailer_webm")] if game.get("trailer_webm") else []
-                    ss_links = [f'<a href="{html.escape(u)}">[{i}]</a>' for i, u in enumerate(screenshots[:4], 1) if u]
-                    tt_links = [f'<a href="{html.escape(u)}">[{i}]</a>' for i, u in enumerate(trailers[:2], 1) if u]
-                    resources_text = ""
-                    if ss_links:
-                        resources_text += f'<b>SS:</b> {" ".join(ss_links)}<br/>'
+                    resources_parts = []
+                    if screenshots:
+                        ss_links = [f'<a href="{html.escape(u)}">[{i}]</a>' for i, u in enumerate(screenshots[:5], 1) if u]
+                        if ss_links:
+                            resources_parts.append(f'<b>SS:</b> {" ".join(ss_links)}')
+                    trailers_raw = game.get("trailers") or game.get("igdb_trailers") or ""
+                    tt_links = []
+                    if isinstance(trailers_raw, str):
+                        trailer_list = [u.strip() for u in re.split(r"[,\|;\n]+", trailers_raw) if u.strip()]
+                    elif isinstance(trailers_raw, list):
+                        trailer_list = trailers_raw
+                    else:
+                        trailer_list = []
+                    for i, u in enumerate(trailer_list, 1):
+                        if u:
+                            tt_links.append(f'<a href="{html.escape(u)}">[{i}]</a>')
                     if tt_links:
-                        resources_text += f'<b>TT:</b> {" ".join(tt_links)}'
-                    if not resources_text:
-                        resources_text = "None"
-                    row.append(Paragraph(resources_text, small_cell_style))
+                        resources_parts.append(f'<b>TT:</b> {" ".join(tt_links)}')
+                    microtrailer_url = game.get("trailer_webm")
+                    if microtrailer_url:
+                        resources_parts.append(f'<b>MT:</b> <a href="{html.escape(microtrailer_url)}">[1]</a>')
+                    resources_text = "<br/>".join(resources_parts) if resources_parts else "None"
+                    row.append(_clipped(Paragraph(resources_text, small_cell_style), col_widths_pts[col_idx]))
                     continue
 
-
+                # --- LINKS ---
                 if key == "links":
                     links_html = []
                     if link_opts["steam"]:
@@ -742,19 +823,19 @@ def _export_games_to_pdf_reportlab(path: str, games: List[Dict], title: Optional
                     if link_opts["steamdb"] and game.get("steamdb_link"):
                         links_html.append(f'<a href="{game["steamdb_link"]}">SteamDB</a>')
                     links_text = " | ".join(links_html) if links_html else "None"
-                    row.append(Paragraph(links_text, cell_style))
+                    row.append(_clipped(Paragraph(links_text, cell_style), col_widths_pts[col_idx]))
                     continue
 
-                
-                # Inside the column loop, after handling 'resources' and 'links'...
+                # --- Other columns ---
                 value = None
                 skip_escape = False
+                title_thumb_flowable = None
+                title_thumb_width = 0.0
 
                 if key == "patch_version":
                     value = game.get("patch_version", "") or game.get("original_title_version", "")
                 elif key == "title":
                     title_text = game.get("title", "")
-                    # Add version if available
                     version = game.get("patch_version", "") or game.get("original_title_version", "")
                     if version:
                         title_text = f"{title_text} ({version})"
@@ -762,7 +843,6 @@ def _export_games_to_pdf_reportlab(path: str, games: List[Dict], title: Optional
                         title_text = f"{title_text} ✅"
                     if game.get("fav"):
                         title_text = f"{title_text} ♥"
-                    # Add user rating (star + rating)
                     rating = game.get("user_rating")
                     if rating is not None and rating != "":
                         try:
@@ -777,30 +857,68 @@ def _export_games_to_pdf_reportlab(path: str, games: List[Dict], title: Optional
                     else:
                         value = escaped_title
                     skip_escape = True
+
+                    # --- Thumbnail (mirrors the HTML export's img_tag) ---
+                    if getattr(config, "EXPORT_THUMBNAILS", True):
+                        thumb_path = _pdf_thumbnail_path(game)
+                        if thumb_path:
+                            try:
+                                # Config values may come through as strings from
+                                # config.ini if reload_config() didn't cast them -
+                                # coerce explicitly instead of assuming int/float.
+                                cfg_w = float(getattr(config, "EXPORT_THUMBNAIL_WIDTH", 32))
+                                cfg_h = float(getattr(config, "EXPORT_THUMBNAIL_HEIGHT", 32))
+                            except (TypeError, ValueError) as e:
+                                print(f"PDF thumbnail: bad EXPORT_THUMBNAIL_WIDTH/HEIGHT config ({e}), using 32x32 fallback")
+                                cfg_w, cfg_h = 32.0, 32.0
+
+                            # px -> pt at 96dpi; cap to a fraction of the
+                            # column so there's still room for the title text
+                            # beside it (side-by-side, like the HTML export).
+                            col_width_pt = col_widths_pts[col_idx]
+                            thumb_w = min(cfg_w * 0.75, col_width_pt * 0.35)
+                            thumb_h = cfg_h * 0.75
+                            try:
+                                title_thumb_flowable = RLImage(thumb_path, width=thumb_w, height=thumb_h)
+                                title_thumb_width = thumb_w
+                            except Exception as e:
+                                # Don't swallow this silently - print so it's
+                                # actually diagnosable (corrupt file, missing
+                                # PIL/Pillow for non-JPEG formats, etc.)
+                                print(f"PDF thumbnail failed for '{game.get('title','?')}' ({thumb_path}): {e}")
+                                title_thumb_flowable = None
                 else:
                     value = game.get(key, "")
 
-                # Convert lists, booleans, etc. (but not for already-HTML columns)
+                # --- Truncate to fill exactly 'description_lines' lines ---
+                # --- Truncate to fill exactly 'description_lines' lines ---
+                textual_keys = {"title","description","genres","themes","developer","publisher",
+                                "game_modes","original_title","original_title_base","original_notes",
+                                "scene_repack","player_perspective","release_date","game_drive"}
+                if not skip_escape and key in textual_keys and value:
+                    avg_char_width = 3.6          # Helvetica 6pt average
+                    safety_margin = 1.0
+                    fill_factor = 0.90            # reduce to avoid overlap in PDF
+                    col_width_pt = col_widths_pts[col_idx]
+                    chars_per_line = int((col_width_pt / avg_char_width) * safety_margin)
+                    max_chars = int(chars_per_line * description_lines * fill_factor)
+                    if isinstance(value, str) and len(value) > max_chars:
+                        value = value[:max_chars] + "…"
+
+                # Convert types
                 if not skip_escape:
                     if key == "user_rating" and value:
                         try:
                             value = f"{float(value):.1f}"
                         except:
                             pass
-                    if key == "description" and description_lines > 0 and desc_idx is not None:
-                        desc_width_pts = col_widths_pts[desc_idx]
-                        avg_char_width = 5
-                        chars_per_line = max(25, int(desc_width_pts / avg_char_width))
-                        max_desc_chars = chars_per_line * min(description_lines, 3)
-                        value = str(value)[:max_desc_chars] + ("..." if len(str(value)) > max_desc_chars else "")
                     elif isinstance(value, list):
                         value = ", ".join(str(v) for v in value if v)
                     elif isinstance(value, bool):
                         value = "Yes" if value else "No"
-                    # Escape plain text
                     value = html.escape(str(value))
 
-                # Now create hyperlinks for app_id and igdb_id if they are plain text (not already linked)
+                # Hyperlink IDs
                 if not skip_escape and key == "app_id" and value.isdigit():
                     steam_link = game.get("steam_link", "")
                     if not steam_link:
@@ -812,16 +930,36 @@ def _export_games_to_pdf_reportlab(path: str, games: List[Dict], title: Optional
                         igdb_link = f"https://www.igdb.com/games/{value}"
                     value = f'<a href="{igdb_link}">{value}</a>'
 
-                row.append(Paragraph(value, cell_style))
-            # Prepend row number
-            row.insert(0, Paragraph(str(idx), cell_style))
+                if title_thumb_flowable is not None:
+                    col_width_pt = col_widths_pts[col_idx]
+                    text_col_width = max(20, col_width_pt - title_thumb_width - 6)
+                    # Side-by-side layout (image left, text right) via a tiny
+                    # nested borderless table, matching the HTML export's
+                    # <img style="vertical-align:middle; margin-right:6px">
+                    # + title text sitting on the same line.
+                    inner = Table(
+                        [[title_thumb_flowable, Paragraph(value, cell_style)]],
+                        colWidths=[title_thumb_width + 6, text_col_width],
+                    )
+                    inner.setStyle(TableStyle([
+                        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                        ('ALIGN', (0, 0), (0, 0), 'LEFT'),
+                        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                        ('RIGHTPADDING', (0, 0), (0, 0), 6),
+                        ('RIGHTPADDING', (1, 0), (1, 0), 0),
+                        ('TOPPADDING', (0, 0), (-1, -1), 0),
+                        ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+                    ]))
+                    row.append(_clipped(inner, col_width_pt))
+                else:
+                    row.append(_clipped(Paragraph(value, cell_style), col_widths_pts[col_idx]))
+            row.insert(0, _clipped(Paragraph(str(idx), cell_style), sn_width))
             table_data.append(row)
 
-        sn_width = usable_width * 0.03
         final_widths = [sn_width] + col_widths_pts
-        table = Table(table_data, colWidths=final_widths, repeatRows=1)
+        row_heights = [None] + [row_height_pts] * len(games)
+        table = Table(table_data, colWidths=final_widths, repeatRows=1, rowHeights=row_heights)
 
-        # Build style commands: base style + row backgrounds
         style_cmds = [
             ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#f2f2f2")),
             ('TEXTCOLOR', (0,0), (-1,0), colors.black),
@@ -833,31 +971,28 @@ def _export_games_to_pdf_reportlab(path: str, games: List[Dict], title: Optional
             ('LEFTPADDING', (0,0), (-1,-1), 2),
             ('RIGHTPADDING', (0,0), (-1,-1), 2),
         ]
-
-        # Add row background colors (skip header row)
         for i, color in enumerate(row_colors):
             style_cmds.append(('BACKGROUND', (0, i+1), (-1, i+1), color))
-
         table.setStyle(TableStyle(style_cmds))
-        
+
         story.append(table)
         story.append(Spacer(1, 6))
-
         footer = Paragraph(f'<font size="7" color="#666666">Report generated by Game Manager • {timestamp} • Total: {total} games • Played: {played} • Remaining: {remaining}</font>', subtitle_style)
         story.append(footer)
         doc.build(story)
+        if open_after:
+            _open_file_with_default_app(path)
         return None
     except Exception as e:
         print(f"PDF export error: {e}")
         import traceback
         traceback.print_exc()
         return f"ReportLab PDF export error: {str(e)}"
-        
-        
+
+  
 def export_games_to_html(path: str, games: List[Dict], title: Optional[str] = None,
                          open_after: bool = False, description_lines: int = 4,
                          columns: Optional[List[Dict]] = None) -> Optional[str]:
-    """Export games to HTML – fixed column widths, no squashing on mobile."""
     try:
         total = len(games)
         played = sum(1 for g in games if g.get("played"))
@@ -891,9 +1026,10 @@ def export_games_to_html(path: str, games: List[Dict], title: Optional[str] = No
 
         total_user_pct = sum(col["width"] for col in columns)
         norm_factors = [(col["width"] / total_user_pct) * 0.97 for col in columns]
-        sn_width = 0.03
 
-        # --- duplicate detection for exported games ---
+        line_height_px = 16
+        row_height_px = line_height_px * description_lines
+
         title_counts = {}
         for g in games:
             t = (g.get("title") or "").strip().lower()
@@ -903,7 +1039,6 @@ def export_games_to_html(path: str, games: List[Dict], title: Optional[str] = No
 
         rows = []
         for idx, game in enumerate(games, 1):
-            # priority: fav > duplicate > played > unplayed
             if game.get("fav", False):
                 raw_color = config.FAVORITE_COLOR
             elif (game.get("title") or "").strip().lower() in dup_titles:
@@ -915,25 +1050,38 @@ def export_games_to_html(path: str, games: List[Dict], title: Optional[str] = No
             bg_color = config.desaturate_color(raw_color, config.HIGHLIGHT_DESATURATE_PERCENT)
 
             row_cells = []
-             # (keep the rest of the loop exactly as before)
-            for col in columns:
+            for col_idx, col in enumerate(columns):
                 key = col["key"]
                 cell_content = ""
+                tooltip = ""
 
+                # --- RESOURCES ---
                 if key == "resources":
                     screenshots = list(game.get("screenshots", []) or []) + list(game.get("image_cache_paths", []) or [])
-                    trailers = [game.get("trailer_webm")] if game.get("trailer_webm") else []
-                    ss_links = [f'<a href="{html.escape(u)}" target="_blank">[{i}]</a>' for i, u in enumerate(screenshots[:5], 1) if u]
-                    tt_links = [f'<a href="{html.escape(u)}" target="_blank">[{i}]</a>' for i, u in enumerate(trailers[:3], 1) if u]
-                    html_str = ""
-                    if ss_links:
-                        html_str += f'<div><strong>SS:</strong> {" ".join(ss_links)}</div>'
+                    html_parts = []
+                    if screenshots:
+                        ss_links = [f'<a href="{html.escape(u)}" target="_blank">[{i}]</a>' for i, u in enumerate(screenshots[:5], 1) if u]
+                        if ss_links:
+                            html_parts.append(f'<div><strong>SS:</strong> {" ".join(ss_links)}</div>')
+                    trailers_raw = game.get("trailers") or game.get("igdb_trailers") or ""
+                    tt_links = []
+                    if isinstance(trailers_raw, str):
+                        trailer_list = [u.strip() for u in re.split(r"[,\|;\n]+", trailers_raw) if u.strip()]
+                    elif isinstance(trailers_raw, list):
+                        trailer_list = trailers_raw
+                    else:
+                        trailer_list = []
+                    for i, u in enumerate(trailer_list, 1):
+                        if u:
+                            tt_links.append(f'<a href="{html.escape(u)}" target="_blank">[{i}]</a>')
                     if tt_links:
-                        html_str += f'<div><strong>TT:</strong> {" ".join(tt_links)}</div>'
-                    if not html_str:
-                        html_str = '<span style="color:#f39c12;font-style:italic;">None</span>'
-                    cell_content = html_str
+                        html_parts.append(f'<div><strong>TT:</strong> {" ".join(tt_links)}</div>')
+                    microtrailer_url = game.get("trailer_webm")
+                    if microtrailer_url:
+                        html_parts.append(f'<div><strong>MT:</strong> <a href="{html.escape(microtrailer_url)}" target="_blank">[1]</a></div>')
+                    cell_content = "".join(html_parts) if html_parts else '<span style="color:#f39c12;font-style:italic;">None</span>'
 
+                # --- LINKS ---
                 elif key == "links":
                     links_html = []
                     if link_opts["steam"]:
@@ -954,9 +1102,9 @@ def export_games_to_html(path: str, games: List[Dict], title: Optional[str] = No
                         links_html.append(f'<a href="{html.escape(game["steamdb_link"])}" target="_blank">SteamDB</a>')
                     cell_content = " | ".join(links_html) if links_html else "None"
 
+                # --- TITLE ---
                 elif key == "title":
                     title_text = game.get("title", "")
-                    # Add version
                     version = game.get("patch_version", "") or game.get("original_title_version", "")
                     if version:
                         title_text = f"{title_text} ({version})"
@@ -971,39 +1119,67 @@ def export_games_to_html(path: str, games: List[Dict], title: Optional[str] = No
                             title_text = f"{title_text} ★{rating_num:.1f}"
                         except:
                             pass
-
-                    # Thumbnail handling
                     img_tag = ""
                     if config.EXPORT_THUMBNAILS:
                         thumb_uri = _get_thumbnail_data_uri(game)
                         w = config.EXPORT_THUMBNAIL_WIDTH
                         h = config.EXPORT_THUMBNAIL_HEIGHT
                         img_tag = f'<img src="{thumb_uri}" width="{w}" height="{h}" style="vertical-align: middle; margin-right: 6px;" loading="lazy">'
-
                     cover_url = game.get("cover_url", "")
                     if cover_url:
                         cell_content = f'<a href="{html.escape(cover_url)}" target="_blank">{img_tag}{html.escape(title_text)}</a>'
                     else:
                         cell_content = f'{img_tag}{html.escape(title_text)}'
 
+                # --- PATCH_VERSION ---
                 elif key == "patch_version":
                     value = game.get("patch_version", "") or game.get("original_title_version", "")
                     cell_content = html.escape(str(value))
 
+                # --- Other columns (all text columns) ---
                 else:
-                    value = game.get(key, "")
+                    # Get raw value (for tooltip)
+                    raw_val = game.get(key, "")
+                    # Convert lists to comma‑separated string
+                    if isinstance(raw_val, list):
+                        raw_str = ", ".join(str(v) for v in raw_val if v)
+                    else:
+                        raw_str = str(raw_val)
+
+                    value = raw_val  # start with raw for processing
+
+                    # Track if we truncate
+                    truncated = False
+
+                    # Truncate textual columns to fill description_lines
+                    textual_keys = {"title","description","genres","themes","developer","publisher",
+                                    "game_modes","original_title","original_title_base","original_notes",
+                                    "scene_repack","player_perspective","release_date","game_drive"}
+                    if key in textual_keys and value:
+                        table_width_px = 1200
+                        avg_char_width = 7.8
+                        safety_margin = 1.0
+                        fill_factor = 1.80
+                        width_pct = norm_factors[col_idx] * 100
+                        col_width_px = (width_pct / 100) * table_width_px
+                        chars_per_line = int((col_width_px / avg_char_width) * safety_margin)
+                        max_chars = int(chars_per_line * description_lines * fill_factor)
+                        if isinstance(value, str) and len(value) > max_chars:
+                            value = value[:max_chars] + "…"
+                            truncated = True
+
+                    # Format special values
                     if key == "user_rating" and value:
                         try:
                             value = f"{float(value):.1f}"
                         except:
                             pass
-                    if key == "description":
-                        max_desc_chars = 80 * description_lines
-                        value = str(value)[:max_desc_chars] + ("..." if len(str(value)) > max_desc_chars else "")
                     if isinstance(value, list):
                         value = ", ".join(str(v) for v in value if v)
+                    # Escape for HTML
                     value = html.escape(str(value))
 
+                    # Create hyperlinks for IDs
                     if key == "app_id" and value.isdigit():
                         steam_link = game.get("steam_link", "")
                         if not steam_link:
@@ -1017,10 +1193,20 @@ def export_games_to_html(path: str, games: List[Dict], title: Optional[str] = No
                     else:
                         cell_content = value
 
-                row_cells.append(f'<td style="padding:6px; border-bottom:1px solid #dee2e6;">{cell_content}</td>')
+                    # If truncated, set tooltip to the raw (un‑truncated) string
+                    if truncated:
+                        tooltip = html.escape(raw_str)
+
+                # Build the <td> with optional tooltip
+                td_style = f"height:{row_height_px}px; overflow:hidden; padding:6px; border-bottom:1px solid #dee2e6; vertical-align:top; word-wrap:break-word;"
+                if tooltip:
+                    row_cells.append(f'<td style="{td_style}" title="{tooltip}">{cell_content}</td>')
+                else:
+                    row_cells.append(f'<td style="{td_style}">{cell_content}</td>')
 
             rows.append(f'<tr style="background-color: {bg_color};"><td>{idx}</td>{''.join(row_cells)}</tr>')
 
+        # Build header and footer
         header_cells = ['<th style="width: 3%;">SN</th>']
         for idx, col in enumerate(columns):
             pct = norm_factors[idx] * 100
@@ -1165,7 +1351,7 @@ def export_games_to_html(path: str, games: List[Dict], title: Optional[str] = No
         return None
     except Exception as e:
         return f"Error exporting to HTML: {str(e)}"
-        
+
 
 def export_file_by_extension(path: str, games: List[Dict], **kwargs) -> Optional[str]:
     ext = Path(path).suffix.lower()
@@ -1174,7 +1360,8 @@ def export_file_by_extension(path: str, games: List[Dict], **kwargs) -> Optional
     elif ext in (".xlsx", ".xls"):
         return export_games_to_excel(path, games)
     elif ext == ".pdf":
-        return export_games_to_pdf(path, games, kwargs.get('title'), kwargs.get('description_lines', 4), kwargs.get('columns'))
+        return export_games_to_pdf(path, games, kwargs.get('title'), kwargs.get('description_lines', 4),
+                                   kwargs.get('columns'), kwargs.get('open_after', False))
     elif ext in (".html", ".htm"):
         return export_games_to_html(path, games, kwargs.get('title'), kwargs.get('open_after', False),
                                     kwargs.get('description_lines', 4), kwargs.get('columns'))

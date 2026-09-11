@@ -3,21 +3,15 @@ import hashlib
 import requests
 from pathlib import Path
 from urllib.parse import urlparse
-from constants import CACHE_DIR, SCRIPT_DIR, CACHE_MIN_KB, CACHE_MAX_KB
+import config
 
 def _to_relative(path: Path) -> str:
     try:
-        return str(path.relative_to(SCRIPT_DIR))
+        return str(path.relative_to(config.SCRIPT_DIR))
     except ValueError:
         return str(path)
 
-def _game_cache_dir_for_game(game: dict) -> Path:
-    """
-    Determine cache subdirectory for a game using:
-      1. app_id (if present)
-      2. igdb_id (if present)
-      3. SHA256(title) (fallback)
-    """
+def _game_cache_dir_for_game(game: dict, create: bool = True) -> Path:
     appid = str(game.get("app_id") or "").strip()
     if appid:
         sub = f"game_{appid}"
@@ -31,15 +25,22 @@ def _game_cache_dir_for_game(game: dict) -> Path:
                 title = "unknown"
             h = hashlib.sha256(title.encode("utf-8")).hexdigest()[:12]
             sub = f"game_{h}"
-    cache_dir = CACHE_DIR / sub
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = config.CACHE_DIR / sub
+    if create:
+        cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
-def _save_bytes_to_game_cache(game: dict, url: str, data: bytes) -> Path:
+def _save_bytes_to_game_cache(game: dict, url: str, data: bytes, cover_type: str = None) -> Path:
+    """
+    Saves raw bytes to the game's cache directory.
+    If cover_type is provided ('igdb' or 'steam'), the file is saved as
+    {cover_type}_coverart.<ext> (e.g., igdb_coverart.jpg, steam_coverart.jpg).
+    Otherwise, a SHA256 hash of the normalized URL is used as the filename.
+    """
     if not isinstance(data, (bytes, bytearray)):
         raise TypeError(f"Expected bytes, got {type(data)}")
-    min_bytes = CACHE_MIN_KB * 1024
-    max_bytes = CACHE_MAX_KB * 1024 if CACHE_MAX_KB else None
+    min_bytes = config.CACHE_MIN_KB * 1024
+    max_bytes = config.CACHE_MAX_KB * 1024 if config.CACHE_MAX_KB else None
     data_len = len(data)
     if data_len < min_bytes:
         raise ValueError(f"Data too small ({data_len} bytes < {min_bytes} bytes)")
@@ -79,16 +80,20 @@ def _save_bytes_to_game_cache(game: dict, url: str, data: bytes) -> Path:
         elif data[:4] == b'RIFF' and data[8:12] == b'WEBP':
             ext = '.webp'
 
-        # Normalize URL: remove query parameters and force https
-    norm_url = url.split('?')[0]
-    if norm_url.startswith('http://'):
-        norm_url = 'https://' + norm_url[7:]
-    url_hash = hashlib.sha256(norm_url.encode("utf-8")).hexdigest()
-    filename = f"{url_hash}{ext}"
+    # Determine filename
+    if cover_type in ('igdb', 'steam'):
+        filename = f"{cover_type}_coverart{ext}"
+    else:
+        norm_url = url.split('?')[0]
+        if norm_url.startswith('http://'):
+            norm_url = 'https://' + norm_url[7:]
+        url_hash = hashlib.sha256(norm_url.encode("utf-8")).hexdigest()
+        filename = f"{url_hash}{ext}"
+
     target_path = cache_dir / filename
     if target_path.exists():
         try:
-            return target_path.relative_to(SCRIPT_DIR)
+            return target_path.relative_to(config.SCRIPT_DIR)
         except ValueError:
             return target_path
 
@@ -100,7 +105,7 @@ def _save_bytes_to_game_cache(game: dict, url: str, data: bytes) -> Path:
         file_type = "microtrailer" if is_microtrailer else "screenshot"
         print(f"[CACHE] Saved {file_type}: {url} -> {absolute_path} ({data_len} bytes, {ext})")
         try:
-            rel_path = target_path.relative_to(SCRIPT_DIR)
+            rel_path = target_path.relative_to(config.SCRIPT_DIR)
             print(f"[CACHE] Relative path: {rel_path}")
             return rel_path
         except ValueError:
@@ -113,18 +118,89 @@ def _save_bytes_to_game_cache(game: dict, url: str, data: bytes) -> Path:
             pass
         raise e
 
+def resolve_cover_art_cache_path(game: dict, cover_url: str = None, cover_type: str = None):
+    """
+    Find the game's locally cached cover art file.
+    - If cover_type is 'steam', look for steam_coverart.*
+    - If cover_type is 'igdb', look for igdb_coverart.*
+    - If cover_url is provided, try hash-based lookup for that specific URL.
+    - Otherwise, fall back to best available.
+    """
+    cache_dir = _game_cache_dir_for_game(game, create=False)
+    if not cache_dir.exists():
+        return None
+
+    # 1. Explicit cover_type request
+    if cover_type == 'steam':
+        for ext in (".jpg", ".jpeg", ".png", ".webp"):
+            candidate = cache_dir / f"steam_coverart{ext}"
+            if candidate.exists():
+                return candidate
+        # No steam file – return None (don't fall back to other files)
+        return None
+
+    if cover_type == 'igdb':
+        for ext in (".jpg", ".jpeg", ".png", ".webp"):
+            candidate = cache_dir / f"igdb_coverart{ext}"
+            if candidate.exists():
+                return candidate
+        return None
+
+    # 2. If cover_url is given, try hash-based lookup (for backward compatibility)
+    if cover_url:
+        norm = cover_url.split('?')[0]
+        if norm.startswith('http://'):
+            norm = 'https://' + norm[7:]
+        url_hash = hashlib.sha256(norm.encode("utf-8")).hexdigest()
+        for f in cache_dir.glob(f"{url_hash}.*"):
+            if f.is_file() and f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+                return f
+        return None
+
+    # 3. No cover_type, no cover_url: fall back to best available
+    # Explicit path (legacy)
+    explicit = game.get("igdb_cover_art_cache_path")
+    if explicit:
+        p = Path(explicit)
+        if not p.is_absolute():
+            p = config.CACHE_DIR / explicit
+        if p.exists():
+            return p
+
+    # Steam -> IGDB -> generic -> hash
+    for ext in (".jpg", ".jpeg", ".png", ".webp"):
+        candidate = cache_dir / f"steam_coverart{ext}"
+        if candidate.exists():
+            return candidate
+    for ext in (".jpg", ".jpeg", ".png", ".webp"):
+        candidate = cache_dir / f"igdb_coverart{ext}"
+        if candidate.exists():
+            return candidate
+    for ext in (".jpg", ".jpeg", ".png", ".webp"):
+        candidate = cache_dir / f"coverart{ext}"
+        if candidate.exists():
+            return candidate
+
+    url = game.get("cover_url") or game.get("igdb_cover_art")
+    if url:
+        norm = url.split('?')[0]
+        if norm.startswith('http://'):
+            norm = 'https://' + norm[7:]
+        url_hash = hashlib.sha256(norm.encode("utf-8")).hexdigest()
+        for f in cache_dir.glob(f"{url_hash}.*"):
+            if f.is_file() and f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+                return f
+
+    return None
+
 def scan_cache_directory_for_game(game: dict) -> dict:
-    """
-    Scan the game's cache directory and return existing screenshot and microtrailer paths.
-    """
     result = {"screenshot_paths": [], "microtrailer_path": ""}
     try:
-        cache_dir = _game_cache_dir_for_game(game)
+        cache_dir = _game_cache_dir_for_game(game, create=False)
         if not cache_dir.exists():
             return result
         all_files = list(cache_dir.iterdir())
 
-        # Helper to normalize URL (remove query params, force https)
         def norm_url(url: str) -> str:
             if '?' in url:
                 url = url.split('?')[0]
@@ -132,11 +208,13 @@ def scan_cache_directory_for_game(game: dict) -> dict:
                 url = 'https://' + url[7:]
             return url
 
-        # Build list of expected URLs (cover + screenshots)
         screenshot_urls = []
         cover_url = game.get("cover_url")
         if cover_url:
             screenshot_urls.append(norm_url(cover_url))
+        igdb_cover = game.get("igdb_cover_art")
+        if igdb_cover:
+            screenshot_urls.append(norm_url(igdb_cover))
         screenshots = game.get("screenshots") or []
         if isinstance(screenshots, list):
             screenshot_urls.extend(norm_url(u) for u in screenshots if u)
@@ -144,7 +222,6 @@ def scan_cache_directory_for_game(game: dict) -> dict:
             parts = [p.strip() for p in screenshots.split(",") if p.strip()]
             screenshot_urls.extend(norm_url(p) for p in parts)
 
-        # Build list of expected microtrailer URLs (normalized)
         microtrailer_urls = []
         if game.get("trailer_webm"):
             microtrailer_urls.append(norm_url(game["trailer_webm"]))
@@ -159,18 +236,18 @@ def scan_cache_directory_for_game(game: dict) -> dict:
             if not file_path.is_file() or file_path.suffix == ".tmp":
                 continue
             try:
-                if file_path.stat().st_size < CACHE_MIN_KB * 1024:
+                if file_path.stat().st_size < config.CACHE_MIN_KB * 1024:
                     continue
             except Exception:
                 continue
 
             file_stem = file_path.stem
-            # Match screenshot URLs
+            # Match screenshot URLs – also match dedicated cover file names
             for url in screenshot_urls:
                 if not url:
                     continue
                 url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()
-                if url_hash in file_stem:
+                if url_hash in file_stem or file_stem.startswith("steam_coverart") or file_stem.startswith("igdb_coverart"):
                     rel_path = _to_relative(file_path)
                     if rel_path not in result["screenshot_paths"]:
                         result["screenshot_paths"].append(rel_path)

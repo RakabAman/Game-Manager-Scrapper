@@ -145,7 +145,7 @@ def merge_and_apply_metadata(games, model, row_index, metadata, window_ref=None,
         COL_MICROTRAILERS = 24
         COL_USER_RATING = 30
         COL_IMAGE_CACHE_PATHS = 27
-        COL_MICROTRAILER_CACHE_PATH = 26
+        COL_MICROTRAILER_CACHE_PATH = 29  # was 26 (COL="original_notes") - fixed, matches gui_main.py
         COL_SAVE_LOCATION = 28
         COL_IGDB_COVER_ART = 31
 

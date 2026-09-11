@@ -19,7 +19,7 @@ def show_about_dialog(parent=None):
     layout.setSpacing(10)
 
     # Header
-    header_label = QLabel("<h2>Game Manager v2.18</h2>")
+    header_label = QLabel("<h2>Game Manager v4.60.12</h2>")
     header_label.setAlignment(Qt.AlignCenter)
     layout.addWidget(header_label)
 
@@ -38,7 +38,20 @@ def show_about_dialog(parent=None):
     <h3>By Rakab Aman</h3>
     <p>A comprehensive game database management tool with metadata scraping capabilities.</p>
 
-    <p><b>Main Features:</b></p>
+    <p><b>Version 4.60.12 Highlights:</b></p>
+    <ul>
+        <li><b>Modern UI Redesign:</b> Choose from three distinct GUI versions (Original, Claude, DeepSeek) via settings – each with a collapsible sidebar, unified details panel, and advanced search/filters.</li>
+        <li><b>Theme System:</b> Fully customisable colour themes (Light, Dark, Rainbow) that control every UI element – from headers and buttons to table backgrounds and text colours.</li>
+        <li><b>Unified Details Panel:</b> A single scrollable view featuring cover art (stretch‑to‑fill), metadata grid, description, 16:9 gallery thumbnails, trailer player (HTML5 with looping), external links, and savegame locations.</li>
+        <li><b>Internal Media Viewer:</b> Full‑screen, frameless popup with keyboard navigation (prev/next, Escape) for images and videos – now uses <code>QWebEngineView</code> for reliable, looping HTML5 video playback.</li>
+        <li><b>Configurable Gallery:</b> Thumbnail size, spacing, corner radius, and visibility are all adjustable via <code>config.ini</code>.</li>
+        <li><b>Cover Art Preference:</b> Choose between Steam or IGDB cover art sources.</li>
+        <li><b>Smart Filters:</b> Quick search and collapsible advanced filters (Genre, Themes, Perspective, Drive, Modes, Developer, Publisher) with multi‑select combo boxes.</li>
+        <li><b>Stat Chips:</b> Clickable pills for Total, Played, Favourites, Remaining, Cached, Duplicates, and Unscraped – filter the table instantly.</li>
+        <li><b>Automatic Collapse:</b> Sidebar and filter overlay hide when clicking outside (configurable).</li>
+    </ul>
+
+    <p><b>Core Features (unchanged):</b></p>
     <ul>
         <li>Import/Export from CSV, JSON, SQLite</li>
         <li>IGDB and Steam metadata scraping</li>
@@ -53,10 +66,11 @@ def show_about_dialog(parent=None):
 
     <p><b>Architecture:</b></p>
     <ul>
-        <li>Main window with table view and details panel</li>
-        <li>Worker threads for background operations</li>
-        <li>Caching system for images and metadata</li>
-        <li>Dialog-based editing and matching</li>
+        <li>Modular design with separate UI version files (<code>gui_main_1/2/3.py</code>)</li>
+        <li>Centralised configuration via <code>config.ini</code> (theme, fonts, colours, UI version)</li>
+        <li>Worker threads for background operations (scraping, caching, exports)</li>
+        <li>Persistent caching system for images and metadata</li>
+        <li>Dialog‑based editing and matching</li>
     </ul>
 
     <p>Built with PyQt5 and Python 3.8+</p>

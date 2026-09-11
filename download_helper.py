@@ -68,20 +68,18 @@ class GameDownloadWorker(QObject):
             self.error.emit(self.game_idx, str(e))
 
     def _download_cover_art(self):
-        url = self.game.get("igdb_cover_art", "")
+        url = self.game.get("igdb_cover_art")
         if not url:
             return "skipped"
 
-        # Check if we already have a path and the file exists
-        existing_path = self.game.get("igdb_cover_art_cache_path", "")
+        existing_path = self.game.get("igdb_cover_art_cache_path")
         if existing_path:
             abs_path = Path(existing_path)
             if not abs_path.is_absolute():
                 abs_path = config.CACHE_DIR / existing_path
             if abs_path.exists():
-                return "skipped"   # already cached
+                return "skipped"
             else:
-                # Path exists in dict but file is missing – clear it and redownload
                 del self.game["igdb_cover_art_cache_path"]
 
         try:
@@ -98,36 +96,79 @@ class GameDownloadWorker(QObject):
             if data_len < min_bytes or (max_bytes and data_len > max_bytes):
                 return "failed"
 
-            from cache_utils import _game_cache_dir_for_game
-            cache_dir = _game_cache_dir_for_game(self.game)
-
-            # Determine extension
-            ext = ".jpg"
-            lower_url = url.lower()
-            if lower_url.endswith('.png'):
-                ext = ".png"
-            elif lower_url.endswith('.webp'):
-                ext = ".webp"
-            elif lower_url.endswith('.jpeg'):
-                ext = ".jpeg"
-            content_type = response.headers.get('content-type', '').lower()
-            if 'png' in content_type:
-                ext = ".png"
-            elif 'webp' in content_type:
-                ext = ".webp"
-            elif 'jpeg' in content_type or 'jpg' in content_type:
-                ext = ".jpg"
-
-            filename = f"coverart{ext}"
-            target_path = cache_dir / filename
-            target_path.write_bytes(response.content)
-            saved_path_str = target_path.as_posix() if hasattr(target_path, 'as_posix') else str(target_path)
+            # Save with cover_type='igdb'
+            saved_path = _save_bytes_to_game_cache(self.game, url, response.content, cover_type='igdb')
+            saved_path_str = saved_path.as_posix() if hasattr(saved_path, 'as_posix') else str(saved_path)
             self.game["igdb_cover_art_cache_path"] = saved_path_str
-            print(f"[DOWNLOAD] Saved cover art to {saved_path_str}")
+            print(f"[DOWNLOAD] Saved IGDB cover art to {saved_path_str}")
             return "downloaded"
         except Exception as e:
             print(f"[DOWNLOAD] Cover art error for {url}: {e}")
             return "failed"
+
+    def _download_screenshots(self, max_to_download):
+        downloaded = 0
+        failed = 0
+        screenshot_urls = []
+        cover_url = self.game.get("cover_url")
+        if cover_url:
+            screenshot_urls.append(cover_url)
+        screenshots = self.game.get("screenshots") or []
+        if isinstance(screenshots, list):
+            screenshot_urls.extend(screenshots)
+        elif isinstance(screenshots, str):
+            parts = [p.strip() for p in screenshots.split(",") if p.strip()]
+            screenshot_urls.extend(parts)
+        screenshot_urls = list(set(u for u in screenshot_urls if u))
+        if not screenshot_urls:
+            return 0, 0
+        existing_hashes = set()
+        for p in self.game.get("image_cache_paths", []):
+            if p:
+                try:
+                    existing_hashes.add(Path(p).stem)
+                except:
+                    pass
+        for url in screenshot_urls:
+            if downloaded >= max_to_download or self.cancelled:
+                break
+            try:
+                if url.startswith("//"):
+                    url = "https:" + url
+                cover_type = None
+                if url == self.game.get("cover_url"):
+                    cover_type = 'steam'
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GameScraper/1.0"}
+                response = requests.get(url, timeout=30, headers=headers)
+                response.raise_for_status()
+                if not response.content:
+                    failed += 1
+                    continue
+                data_len = len(response.content)
+                min_bytes = config.CACHE_MIN_KB * 1024
+                max_bytes = config.CACHE_MAX_KB * 1024 if config.CACHE_MAX_KB else None
+                if data_len < min_bytes or (max_bytes and data_len > max_bytes):
+                    failed += 1
+                    continue
+                content_type = response.headers.get('content-type', '').lower()
+                if content_type and 'image' not in content_type:
+                    failed += 1
+                    continue
+                saved_path = _save_bytes_to_game_cache(self.game, url, response.content, cover_type=cover_type)
+                saved_path_str = saved_path.as_posix() if hasattr(saved_path, 'as_posix') else str(saved_path)
+                if "image_cache_paths" not in self.game:
+                    self.game["image_cache_paths"] = []
+                if saved_path_str not in self.game["image_cache_paths"]:
+                    if len(self.game["image_cache_paths"]) < config.MAX_IMAGES_TO_DISPLAY:
+                        self.game["image_cache_paths"].append(saved_path_str)
+                    else:
+                        self.game["image_cache_paths"].pop(0)
+                        self.game["image_cache_paths"].append(saved_path_str)
+                downloaded += 1
+            except Exception as e:
+                print(f"[DOWNLOAD] Screenshot error for {url}: {e}")
+                failed += 1
+        return downloaded, failed
 
     def _scan_cache(self):
         from cache_utils import scan_cache_directory_for_game
@@ -182,70 +223,6 @@ class GameDownloadWorker(QObject):
                 print(f"[DOWNLOAD] Microtrailer error for {url}: {e}")
         return "failed"
 
-    def _download_screenshots(self, max_to_download):
-        downloaded = 0
-        failed = 0
-        screenshot_urls = []
-        cover_url = self.game.get("cover_url")
-        if cover_url:
-            screenshot_urls.append(cover_url)
-        screenshots = self.game.get("screenshots") or []
-        if isinstance(screenshots, list):
-            screenshot_urls.extend(screenshots)
-        elif isinstance(screenshots, str):
-            parts = [p.strip() for p in screenshots.split(",") if p.strip()]
-            screenshot_urls.extend(parts)
-        screenshot_urls = list(set(u for u in screenshot_urls if u))
-        if not screenshot_urls:
-            return 0, 0
-        existing_hashes = set()
-        for p in self.game.get("image_cache_paths", []):
-            if p:
-                try:
-                    existing_hashes.add(Path(p).stem)
-                except:
-                    pass
-        for url in screenshot_urls:
-            if downloaded >= max_to_download or self.cancelled:
-                break
-            try:
-                if url.startswith("//"):
-                    url = "https:" + url
-                url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()
-                if url_hash in existing_hashes:
-                    continue
-                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GameScraper/1.0"}
-                response = requests.get(url, timeout=30, headers=headers)
-                response.raise_for_status()
-                if not response.content:
-                    failed += 1
-                    continue
-                data_len = len(response.content)
-                min_bytes = config.CACHE_MIN_KB * 1024
-                max_bytes = config.CACHE_MAX_KB * 1024 if config.CACHE_MAX_KB else None
-                if data_len < min_bytes or (max_bytes and data_len > max_bytes):
-                    failed += 1
-                    continue
-                content_type = response.headers.get('content-type', '').lower()
-                if content_type and 'image' not in content_type:
-                    failed += 1
-                    continue
-                saved_path = _save_bytes_to_game_cache(self.game, url, response.content)
-                saved_path_str = saved_path.as_posix() if hasattr(saved_path, 'as_posix') else str(saved_path)
-                if "image_cache_paths" not in self.game:
-                    self.game["image_cache_paths"] = []
-                if saved_path_str not in self.game["image_cache_paths"]:
-                    if len(self.game["image_cache_paths"]) < config.MAX_IMAGES_TO_DISPLAY:
-                        self.game["image_cache_paths"].append(saved_path_str)
-                    else:
-                        self.game["image_cache_paths"].pop(0)
-                        self.game["image_cache_paths"].append(saved_path_str)
-                downloaded += 1
-            except Exception as e:
-                print(f"[DOWNLOAD] Screenshot error for {url}: {e}")
-                failed += 1
-        return downloaded, failed
-
 
 class DownloadManager:
     def __init__(self, parent_window):
@@ -276,7 +253,8 @@ class DownloadManager:
             return
         self._cancel_flag = False
         self.parent._cancel_current_scrape = False
-        self.parent.cancel_scrape_btn.setVisible(True)
+        # Use the parent's method to show/hide the cancel button
+        self.parent.set_cancel_button_visible(True)
         self.parent.scrape_btn.setEnabled(False)
         self._download_stats = {
             "total_games": len(games),
@@ -289,7 +267,6 @@ class DownloadManager:
         }
         self._pending_games = list(range(len(games)))
         self._active_workers = []
-        # Show progress bar
         self.parent.progress_bar.setVisible(True)
         self.parent.progress_bar.setMaximum(len(games))
         self.parent.progress_bar.setValue(0)
@@ -367,8 +344,9 @@ class DownloadManager:
         msg_box.exec_()
         self.parent.refresh_model()
         self.parent.status.setText(f"Download complete: {total_screenshots} screenshots, {total_microtrailers} microtrailers")
+        # Re-enable scrape button and hide cancel
         self.parent.scrape_btn.setEnabled(True)
-        self.parent.cancel_scrape_btn.setVisible(False)
+        self.parent.set_cancel_button_visible(False)
         self.parent.progress_bar.setVisible(False)
 
     def _update_game_cache_fields(self, game_idx, game):
@@ -379,11 +357,9 @@ class DownloadManager:
             cache_text = ", ".join(str(p) for p in cache_paths if p)
         else:
             cache_text = str(cache_paths)
-        # COL_IMAGE_CACHE_PATHS = 27 in gui_main.py
-        self.parent.model.setItem(game_idx, 27, QStandardItem(cache_text))
+        self.parent.model.setItem(game_idx, self.parent.COL_IMAGE_CACHE_PATHS, QStandardItem(cache_text))
         microtrailer_path = game.get("microtrailer_cache_path", "")
-        # COL_MICROTRAILER_CACHE_PATH = 26 in gui_main.py
-        self.parent.model.setItem(game_idx, 26, QStandardItem(str(microtrailer_path)))
+        self.parent.model.setItem(game_idx, self.parent.COL_MICROTRAILER_CACHE_PATH, QStandardItem(str(microtrailer_path)))
         title_item = self.parent.model.item(game_idx, 0)
         if title_item:
             title_item.setData(game, Qt.UserRole)

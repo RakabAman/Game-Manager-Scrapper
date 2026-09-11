@@ -1,76 +1,119 @@
-# trailer_player.py
-import requests
-from PyQt5.QtCore import QUrl, QBuffer, QByteArray, QTimer
-from PyQt5.QtGui import QMovie
-from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
-from config import SCRIPT_DIR, VIDEO_LOOP_ENABLED
+#!/usr/bin/env python3
+# trailer_player.py – Reliable video playback using QWebEngineView (HTML5 video)
+
+import config
+from PyQt5.QtCore import QUrl
+from PyQt5.QtWidgets import QVBoxLayout, QLabel
+from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineSettings
+from PyQt5.QtCore import Qt
+
 
 class TrailerPlayerManager:
     def __init__(self, parent_window):
         self.parent = parent_window
-        self.media_player = parent_window.media_player
-        self.video_widget = parent_window.video_widget
-        self.trailer_gif_label = parent_window.trailer_gif_label
-        self._current_trailer_url = ""
 
-    def play_trailer_media(self, url: str):
-        self._current_trailer_url = url
-        self.video_widget.set_url(url)
-        self.trailer_gif_label.set_url(url, "")
-        # Check cached microtrailer first
-        try:
-            rel_path = self.parent.games[self.parent._current_row].get("microtrailer_cache_path")
+        # --- Prepare the container ---
+        container = parent_window.trailer_container
+        if container.layout():
+            old = container.layout()
+            while old.count():
+                item = old.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            del old
+
+        self.layout = QVBoxLayout(container)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(0)
+
+        # --- Web view ---
+        self.web_view = QWebEngineView()
+        settings = self.web_view.settings()
+        settings.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls, True)
+        settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+        settings.setAttribute(QWebEngineSettings.ErrorPageEnabled, False)
+
+        self.web_view.setStyleSheet("background-color: #111; border: none; margin: 0; padding: 0;")
+        self.layout.addWidget(self.web_view)
+
+        self.status_label = getattr(parent_window, 'status', None)
+
+    def _set_status(self, msg):
+        if self.status_label:
+            self.status_label.setText(msg)
+        else:
+            print(f"[TRAILER] {msg}")
+
+    def play_trailer_media(self, url: str, game: dict = None):
+        final_source = None
+        base_url = QUrl("about:blank")  # default
+
+        if game is not None:
+            rel_path = game.get("microtrailer_cache_path")
             if rel_path:
-                abs_path = SCRIPT_DIR / rel_path
+                abs_path = config.SCRIPT_DIR / rel_path
                 if abs_path.exists():
-                    media = QMediaContent(QUrl.fromLocalFile(str(abs_path)))
-                    self.media_player.setMedia(media)
-                    self.media_player.play()
-                    return
-        except:
-            pass
+                    final_source = QUrl.fromLocalFile(str(abs_path)).toString()
+                    base_url = QUrl.fromLocalFile(str(abs_path.parent))   # <-- set base to the folder
+                    self._set_status("🎬 Playing from cache")
+        
+        if not final_source and url:
+            final_source = url
+            self._set_status("🌐 Streaming from network")
 
-        self.media_player.stop()
-        if hasattr(self.trailer_gif_label, "movie") and self.trailer_gif_label.movie():
-            self.trailer_gif_label.movie().stop()
-            self.trailer_gif_label.clear()
-
-        if not url:
+        if not final_source:
+            self._show_unavailable("No trailer URL available.")
             return
 
-        lower = url.lower()
-        if lower.endswith(".gif"):
-            try:
-                r = requests.get(url, timeout=8, headers={"User-Agent": "GameScraper/1.0"})
-                if r.status_code == 200 and r.content:
-                    movie = QMovie()
-                    movie.setCacheMode(QMovie.CacheAll)
-                    movie.setDevice(QBuffer(QByteArray(r.content)))
-                    if movie.isValid():
-                        self.trailer_gif_label.setMovie(movie)
-                        movie.start()
-                        self.video_widget.hide()
-                        self.trailer_gif_label.show()
-                    else:
-                        print("[DEBUG] GIF invalid")
-            except Exception as e:
-                print(f"[DEBUG] GIF error: {e}")
-                self.parent.status.setText("Failed to load GIF trailer.")
-        else:
-            self.trailer_gif_label.hide()
-            self.video_widget.show()
-            qurl = QUrl(url)
-            media = QMediaContent(qurl)
-            self.media_player.setMedia(media)
-            self.media_player.setMuted(True)
-            self.media_player.play()
-            # Check if playback failed after 2 seconds
-            def check():
-                if self.media_player.state() != 1:
-                    self.parent.trailer_container.hide()
-            QTimer.singleShot(2000, check)
+        html = self._build_video_html(final_source)
+        self.web_view.setHtml(html, base_url)   # <-- pass base_url
 
-    def on_media_status_changed(self, status):
-        if status == QMediaPlayer.EndOfMedia and VIDEO_LOOP_ENABLED:
-            self.media_player.setPosition(0)
-            self.media_player.play()
+    def _build_video_html(self, src: str) -> str:
+        safe_src = src.replace("'", "\\'")
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <style>
+                html, body {{
+                    margin: 0;
+                    padding: 0;
+                    width: 100%;
+                    height: 100%;
+                    background-color: #111;
+                    overflow: hidden;
+                }}
+                video {{
+                    display: block;
+                    width: 100%;
+                    height: 100%;
+                    object-fit: contain;
+                    background-color: #111;
+                }}
+            </style>
+        </head>
+        <body>
+            <video id="player" src="{safe_src}" autoplay loop muted playsinline></video>
+            <script>
+                var video = document.getElementById('player');
+                video.onerror = function() {{
+                    var msg = document.createElement('div');
+                    msg.style.cssText = 'position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); color:#ccc; font-size:16px; text-align:center;';
+                    msg.innerText = '⚠ Video failed to load. Click the ▶ button to open in your browser.';
+                    document.body.appendChild(msg);
+                }};
+            </script>
+        </body>
+        </html>
+        """
+
+    def _show_unavailable(self, message: str):
+        html = f"""
+        <html><head><style>
+            body {{ background: #111; color: #ccc; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; text-align: center; }}
+        </style></head>
+        <body><div>{message}</div></body></html>
+        """
+        self.web_view.setHtml(html)
+        self._set_status(message)

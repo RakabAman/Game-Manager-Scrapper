@@ -65,12 +65,18 @@ def _update_model_row(games, model, row_index):
         return
     game = games[row_index]
     
-    # Column indices (must match GameManager constants)
+    # Column indices - MUST match GameManager's real constants in gui_main.py.
+    # These three were previously stale (11/6/13) from an older column layout,
+    # silently corrupting COL_PUB, COL_GENRES, and COL_PERSPECTIVE on every
+    # sanitize call. Fixed to match gui_main.py exactly - if columns are ever
+    # reordered again, update gui_main.py first and mirror the values here,
+    # or better, import them directly from the GameManager instance instead
+    # of hardcoding a second copy.
     COL_TITLE = 0
-    COL_SCENE = 11
-    COL_GAME_MODES = 6
+    COL_SCENE = 12
+    COL_GAME_MODES = 7
     COL_VERSION = 1
-    COL_ORIGINAL = 13
+    COL_ORIGINAL = 14
     
     if model:
         # Update title cell

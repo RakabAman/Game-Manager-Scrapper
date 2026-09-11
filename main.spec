@@ -6,7 +6,7 @@ from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 block_cipher = None
 
-# --- Force collect reportlab (even if hooks fail) ---
+# --- ReportLab data and hidden imports (from original) ---
 reportlab_hidden = [
     'reportlab',
     'reportlab.pdfgen',
@@ -22,16 +22,13 @@ reportlab_hidden = [
     'reportlab.graphics.shapes',
     'reportlab.graphics.renderPDF',
 ]
-# Try to collect submodules automatically as fallback
 try:
     reportlab_hidden += collect_submodules('reportlab')
 except:
     pass
-
-# Collect data files (fonts, etc.)
 reportlab_datas = collect_data_files('reportlab')
 
-# --- Collect Pillow (required by reportlab) ---
+# --- Pillow (required by reportlab, also used for icons) ---
 pillow_hidden = ['PIL', 'PIL.Image', 'PIL.ImageDraw', 'PIL.ImageFont']
 try:
     pillow_hidden += collect_submodules('PIL')
@@ -39,7 +36,8 @@ except:
     pass
 pillow_datas = collect_data_files('PIL')
 
-# Excluded large/unused modules
+# --- Excluded modules (large/unused) ---
+# IMPORTANT: Do NOT exclude QtWebEngine or QtWebEngineWidgets – they are needed for the trailer player.
 excluded_modules = [
     'tkinter',
     'matplotlib',
@@ -47,8 +45,9 @@ excluded_modules = [
     'scipy',
     'pandas.tests',
     'openpyxl.tests',
-    'PyQt5.QtWebEngine',
-    'PyQt5.QtWebEngineWidgets',
+    # QtWebEngine is required – keep it
+    # 'PyQt5.QtWebEngine',
+    # 'PyQt5.QtWebEngineWidgets',
     'PyQt5.QtQuick',
     'PyQt5.QtQml',
     'PyQt5.QtPositioning',
@@ -63,17 +62,21 @@ excluded_modules = [
 ]
 
 a = Analysis(
-    ['gui_main.py'],
+    ['main.py'],  # <-- Entry point is main.py (not gui_main.py)
     pathex=[],
     binaries=[],
+    # Icon and data files from reportlab and Pillow
     datas=[('icon.ico', '.')] + reportlab_datas + pillow_datas,
     hiddenimports=[
+        # Core PyQt5
         'PyQt5.sip',
         'PyQt5.QtCore',
         'PyQt5.QtGui',
         'PyQt5.QtWidgets',
         'PyQt5.QtMultimedia',
         'PyQt5.QtMultimediaWidgets',
+        'PyQt5.QtWebEngineWidgets',   # explicitly required for trailer player
+        # Third-party
         'requests',
         'configparser',
         'hashlib',
@@ -95,6 +98,18 @@ a = Analysis(
         'pandas',
         'openpyxl',
         'fpdf',
+        # ---- Custom UI modules (all three versions and helpers) ----
+        'gui_main_1',
+        'gui_main_2',
+        'gui_main_3',
+        'ui_header',
+        'ui_sidebar',
+        'ui_details_panel',
+        'widgets',
+        'image_display',
+        'trailer_player',
+        'settings_dialog',
+        'config',
     ] + reportlab_hidden + pillow_hidden,
     hookspath=[],
     hooksconfig={},
@@ -118,16 +133,16 @@ exe = EXE(
     name='GameManager',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,               # Disable stripping to avoid Windows errors
-    upx=True,
+    strip=False,               # Prevent FileNotFoundError on Windows (strip.exe missing)
+    upx=True,                  # Use UPX if installed; set False if you don't have it
     upx_exclude=['vcruntime140.dll'],
     runtime_tmpdir=None,
-    console=True,
+    console=False,              # Console window (show/hide controlled by config)
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
     icon='icon.ico',
-    onefile=True,
+    onefile=True,              # Single executable
 )
