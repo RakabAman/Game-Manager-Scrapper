@@ -194,6 +194,11 @@ class GameManager(QMainWindow):
     def scrape_btn(self):
         return self.sidebar.btn_scrape
 
+    # ADD THIS ↓
+    @property
+    def cancel_scrape_btn(self):
+        return self.sidebar.btn_cancel
+
     def _apply_table_font(self):
         font = self.table.font()
         font.setPointSize(config.TABLE_DATA_FONT_SIZE)
